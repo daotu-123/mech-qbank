@@ -1,0 +1,28 @@
+题库内容许可：CC BY-SA 4.0
+Content license: Creative Commons Attribution-ShareAlike 4.0 International
+
+适用于本仓库中的**题库文本与知识点卡片内容**（`data/` 下的题目、卡片文本，以及由本仓库
+维护者撰写并收录的题目与知识点）。代码部分另见 `LICENSE`（MIT）。
+
+You are free to:
+  Share  — copy and redistribute the material in any medium or format
+  Adapt  — remix, transform, and build upon the material for any purpose,
+           even commercially.
+
+Under the following terms:
+  Attribution — You must give appropriate credit, provide a link to the license,
+                and indicate if changes were made.
+  ShareAlike  — If you remix, transform, or build upon the material, you must
+                distribute your contributions under the same license as the original.
+  No additional restrictions — You may not apply legal terms or technological
+                measures that legally restrict others from doing anything the
+                license permits.
+
+Full text: https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+重要说明 / Important:
+  本仓库**不收录**任何公司笔试卷、培训机构套卷或第三方网站面经内容。
+  若你认为仓库中的某条内容侵犯了你的权利，请开 issue 说明，我们会立即移除。
+  This repository does NOT include any company exam papers, training-institute
+  test sets, or third-party website interview collections. If you believe any
+  content infringes your rights, please open an issue and it will be removed.

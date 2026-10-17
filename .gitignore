@@ -1,0 +1,38 @@
+# ---- 本地数据（含公司真题 / 个人进度，一律不入库）----
+data/qbank.sqlite
+data/qbank.sqlite.new
+data/qbank.sqlite-*
+data/progress.json
+data/checkin.json
+data/private/
+源材料/
+*.bak-*
+_历史备份/
+
+# ---- 构建报告（含本机源路径与私有题库统计）----
+BUILD_REPORT.md
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.spec
+*.log
+
+# ---- 打包产物 ----
+dist/
+build/
+*.exe
+*.apk
+*.apk.idsig
+
+# ---- 本机交接文档（含本机绝对路径，勿随公开仓发布）----
+技术文档.md
+tools/qbank_src.txt
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
