@@ -5,11 +5,11 @@
  * app/server.py 同源的 Store（grade/mark/pick/search/cards/stats/进度存取），
  * 进度写 localStorage。UI 层 index.html 的 api() 在 file:// 下路由到这里。
  *
- * 判分与间隔逻辑照抄 server.py（2026-10-16 版），改动必须两边同步：
+ * 判分与间隔逻辑照抄 server.py（2026-10-16 版），改动必须两边同步（tools/smoke_parity.py 守着）：
  *   · 判断题：对/正确/√/T/1 → '对'，错/×/F/0 → '错'；带 A.对/B.错 选项时按选项文本映射
  *   · 选择题：答案为纯字母串时集合严格相等（多选必须全选对）；历史数据兜底取开头字母串
  *   · 其余（问答/计算/长答案）自评：correct=null
- *   · 间隔：答对按 1/3/7/15/30/60 天（streak 封顶 6 档），答错次日必回，跳过 3 天后回
+ *   · 间隔：答对按 DATA.intervals（默认 1/3/7/15/30/60 天，streak 封顶），答错次日必回，跳过 3 天后回
  *
  * 自定义题库导入（2026-10-17 加）：merge_questions() 把用户 JSON 并入内存题库，
  * 持久化在 localStorage 的 mech-qbank-custom 键；id 撞内置题一律拒绝，防覆盖。
@@ -23,7 +23,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  var INTERVALS = [1, 3, 7, 15, 30, 60];   // 与 server.py INTERVALS 一致
+  var INTERVALS = [1, 3, 7, 15, 30, 60];   // 默认值；实际取 DATA.intervals（与 server.py INTERVALS 同源）
   var WRONG_BACK = 1;                       // 答错次日必回
   var SKIP_BACK = 3;                        // 跳过 3 天后回
   var PROG_KEY = 'mech-qbank-progress';     // localStorage 键（进度按题号存）
@@ -75,6 +75,12 @@
 
   function make(DATA, storage) {
     DATA = DATA || {};
+    // 复习间隔与 app/server.py 的 INTERVALS 同源：数据由 tools/make_webdata.py 从
+    // QBANK_INTERVALS 环境变量写入。曾经这里硬编码 [1,3,7,15,30,60]，导致设了环境变量后
+    // 在线模式按服务端排期、离线模式按默认排期而分叉（界面还显示服务端的值，用户无从察觉）。
+    // 一致性由 tools/smoke_parity.py 的排期校验兜底。
+    var IV = (Array.isArray(DATA.intervals) && DATA.intervals.length)
+      ? DATA.intervals.slice() : INTERVALS;
     var builtin = DATA.questions || [];
     var cardsList = DATA.cards || [];
     var builtinById = {};
@@ -251,7 +257,7 @@
       var days;
       if (result === 'correct') {
         streak += 1; state = 'correct';
-        days = INTERVALS[Math.min(streak, INTERVALS.length) - 1];   // 1→1天 2→3天 … 6+→60天
+        days = IV[Math.min(streak, IV.length) - 1];   // 1→1天 2→3天 … 6+→60天
       } else if (result === 'wrong') {
         streak = 0; wrong += 1; state = 'wrong'; days = WRONG_BACK;  // 次日必回
       } else {
@@ -385,7 +391,7 @@
       });
       return { mode: 'static', total: questions.length, cards: cardsList.length,
                answered: answered, correct: ok, wrong: wrong, due: due, today: today, today_ok: todayOk,
-               by_level: byLevel, by_class: byClass, by_type: byType, intervals: INTERVALS.slice() };
+               by_level: byLevel, by_class: byClass, by_type: byType, intervals: IV.slice() };
     }
 
     function exportProgress() {

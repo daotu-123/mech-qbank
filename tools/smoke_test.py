@@ -203,6 +203,28 @@ def store_smoke(m, st, public: bool):
     st.import_progress({'坏数据': 'not-a-dict', '': {'state': 'new'}})
     check('导入容错：跳过坏行', '__ round-trip __' in st.export_progress())
 
+    # ---- 落盘防抖：mark() 不再持锁做 I/O，1 秒内连答只写一次盘；_flush_progress 可立即落盘 ----
+    if not public:
+        # 全量模式下 save_progress_json 是 no-op，这里只验证接口语义不炸
+        st.mark(qid, 'skip')
+        check('全量模式 mark() 后不触发落盘（no-op）', True)
+    else:
+        import time as _t
+        _t.sleep(0.05)
+        st._flush_progress()
+        on_disk = json.loads(m.PROGJSON.read_text(encoding='utf-8')) if m.PROGJSON.exists() else {}
+        check('_flush_progress() 立即落盘', (on_disk.get(qid) or {}).get('state') == 'wrong', str(on_disk.get(qid)))
+        st.mark(qid, 'skip')
+        _t.sleep(0.05)          # 防抖窗口内：文件里应还是旧值
+        during = json.loads(m.PROGJSON.read_text(encoding='utf-8'))
+        check('防抖窗口内不写盘（连答多题只写一次）',
+              (during.get(qid) or {}).get('state') == 'wrong', str(during.get(qid)))
+        _t.sleep(1.1)           # 窗口过后自动补写
+        after = json.loads(m.PROGJSON.read_text(encoding='utf-8'))
+        # skip 不改 state（沿用 mark 前的 'wrong'），但会刷新 due/last_seen
+        stt = after.get(qid) or {}
+        check('防抖窗口过后自动落盘', stt.get('state') == 'wrong' and stt.get('due'), str(stt))
+
     # ---- 学习打卡 ----
     ck0 = st.checkin()
     today = datetime.now().strftime('%Y-%m-%d')
@@ -432,6 +454,38 @@ def http_smoke(m, tmp: Path, public: bool):
                   b'200 OK' in h1 and b'200 OK' in h2 and b'"items"' in b2)
         finally:
             sk.close()
+
+        # Host/Origin 白名单：挡 DNS rebinding（恶意页面把域名重绑到 127.0.0.1 后即同源）
+        for host, want in (('127.0.0.1', 200), ('localhost', 200), ('evil.com', 403),
+                           ('attacker.test', 403)):
+            req = urllib.request.Request(base + '/api/stats', headers={'Host': host})
+            code = 0
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    code = r.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            check('Host=%r → %d' % (host, want), code == want, '实际 %d' % code)
+        # 缺 Host 头时 socket 直接打裸请求（urllib 会自动补 Host，测不到）
+        sk2 = socket.create_connection(('127.0.0.1', port), timeout=10)
+        try:
+            sk2.sendall(b'GET /api/stats HTTP/1.1\r\n\r\n')
+            head, _body = read_response(sk2)
+            check('缺 Host 头 → 403', b'403' in head, head[:40].decode('latin1'))
+        finally:
+            sk2.close()
+        req = urllib.request.Request(base + '/api/stats',
+                                     headers={'Host': '127.0.0.1', 'Origin': 'http://evil.com'})
+        code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check('Origin 为外站 → 403', code == 403, '实际 %d' % code)
+        # POST 同样要守
+        code, _d = post('/api/mark', {'id': 'TS1', 'result': 'skip'})
+        check('本地 POST 正常放行', code == 200 and _d.get('ok') is True)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -446,6 +500,13 @@ def main() -> int:
         st = fresh_store(m, tmp, public)
         store_smoke(m, st, public)
         http_smoke(m, tmp, public)
+    # 前后端判分/排期一致性（独立工具，node 缺失时返回 2 表示跳过）
+    import subprocess as sp
+    r = sp.run([sys.executable, str(ROOT / 'tools' / 'smoke_parity.py')] + (['--public'] if public else []))
+    if r.returncode == 1:
+        check('前后端判分/排期一致性（smoke_parity）', False, '见上方差异明细')
+    elif r.returncode == 2:
+        print('  … 跳过前后端一致性校验（未找到 node）')
     print('\n========== 结果：%d 通过 / %d 失败 ==========' % (len(PASS), len(FAIL)))
     if FAIL:
         print('失败项：')

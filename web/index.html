@@ -363,7 +363,7 @@
 </script>
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s??'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = s => String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ---- 题型 / 难度 元数据（徽章配色与档位名）----
 const QT_ICON = {

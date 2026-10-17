@@ -18,6 +18,7 @@ make_webdata.py — 把公开子集压成 APK 可直接加载的 JS 数据文件
 """
 from __future__ import annotations
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -71,6 +72,10 @@ def main() -> int:
         'license': pub.get('license', ''),
         'generated_at': datetime.now().isoformat(timespec='seconds'),
         'generator': 'tools/make_webdata.py',
+        # 复习间隔与 server.py 的 INTERVALS 同源：避免设了 QBANK_INTERVALS 后，
+        # 在线模式按服务端排期、离线模式按 [1,3,7,15,30,60] 排期而分叉。
+        'intervals': [int(x) for x in os.environ.get('QBANK_INTERVALS', '1,3,7,15,30,60')
+                      .replace('，', ',').split(',') if x.strip().isdigit()] or [1, 3, 7, 15, 30, 60],
         'questions': [{k: q.get(k) for k in ('id', 'bank', 'section_path', 'cat_name', 'stem', 'qtype',
                                              'level', 'options', 'answer', 'explanation', 'source_class')}
                       for q in questions],
@@ -80,13 +85,15 @@ def main() -> int:
     body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))   # 紧凑排版，APK 体积优先
     js = ('/* 由 tools/make_webdata.py 自动生成，请勿手改。\n'
           '   数据来源 data/public/qbank.json（公开子集：自出题 + 通用知识点，已过三道闸）；\n'
-          '   APK 静态模式经 <script src="qbank-data.js"> 加载，绕过 file:// 的 fetch CORS 限制。 */\n'
+          '   APK 静态模式经 <script src="qbank-data.js"> 加载，绕过 file:// 的 fetch CORS 限制。\n'
+          '   intervals 与 app/server.py 的 INTERVALS 同源，见 tools/smoke_parity.py 的排期一致性校验。 */\n'
           'window.QBANK_DATA = %s;\n' % body)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(js, encoding='utf-8')
     print('✓ 已生成 %s' % OUT)
-    print('  题目 %d ｜ 卡片 %d ｜ %.1f KB ｜ 生成于 %s'
+    print('  题目 %d ｜ 卡片 %d ｜ 复习间隔 %s ｜ %.1f KB ｜ 生成于 %s'
           % (len(payload['questions']), len(payload['cards']),
+             '/'.join(str(x) for x in payload['intervals']),
              OUT.stat().st_size / 1024, payload['generated_at']))
     print('  进度存储键：%s（localStorage，见 web/qbank-static.js）' % PROG_KEY)
     return 0

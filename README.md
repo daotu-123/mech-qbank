@@ -23,17 +23,18 @@ export QBANK_SRC=/path/to/your/qbank      # Windows: set QBANK_SRC=D:\your\qbank
 python tools/qbank_build.py
 
 # 2) 冒烟测试（不依赖浏览器；全量模式用临时副本，不碰真实数据）
-python tools/smoke_test.py            # 服务端全量模式
+python tools/smoke_test.py            # 服务端全量模式（收尾自动跑前后端一致性）
 python tools/smoke_test.py --public   # 服务端公开子集模式
 node tools/smoke_static.js            # APK 静态模式（纯前端 Store，需 Node）
 python tools/audit_types.py           # 题型审查：结构自洽性核对（有问题退出码 1）
+python tools/smoke_parity.py          # 前后端判分/排期一致性（需 Node；缺 Node 时跳过）
 
 # 3) 启动
 python app/server.py        # 或 Windows 双击 start.bat
 # → http://127.0.0.1:8640
 ```
 
-要求 Python 3.10+，无 pip 依赖。环境变量：`QBANK_SRC` 源题库目录、`QBANK_PORT` 改端口（被占用时自动顺延，`QBANK_PORT_SCAN` 控制尝试个数）、`QBANK_NO_BROWSER=1` 关自动开浏览器、`QBANK_INTERVALS` 自定义复习间隔（默认 `1,3,7,15,30,60`）。
+要求 Python 3.10+，无 pip 依赖。环境变量：`QBANK_SRC` 源题库目录、`QBANK_PORT` 改端口（被占用时自动顺延，`QBANK_PORT_SCAN` 控制尝试个数）、`QBANK_NO_BROWSER=1` 关自动开浏览器、`QBANK_INTERVALS` 自定义复习间隔（默认 `1,3,7,15,30,60`；会同时写进 `web/qbank-data.js`，离线端按同一套排期）。
 
 ## 功能
 
@@ -71,6 +72,7 @@ mech-qbank/
 ├ tools/make_webdata.py    公开子集 → qbank-data.js（写前重跑三道闸）
 ├ tools/smoke_test.py      冒烟测试：服务端全链路（全量/公开两种模式）
 ├ tools/smoke_static.js    冒烟测试：静态模式 Store（Node 运行）
+├ tools/smoke_parity.py    前后端判分/排期一致性差分测试（改判分逻辑必跑）
 ├ tools/audit_types.py     题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
@@ -135,6 +137,7 @@ pyinstaller --noconfirm --onefile --name mech-qbank ^
 - **双击即用**：自带公开题库（76 题 + 387 知识点卡），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
 - **想用你自己的全量库**：把 `qbank.sqlite` 放进 exe 同级的 `data\` 目录即可，程序自动切换成全量模式（实测：2330 题）
 - 端口默认 8640，可用环境变量 `QBANK_PORT` 改；`QBANK_NO_BROWSER=1` 可关掉自动开浏览器
+- 服务**只监听 127.0.0.1**，且校验请求的 `Host`/`Origin` 必须在 `127.0.0.1` / `localhost` 白名单内 —— 用于防御 DNS rebinding 攻击（恶意网页把域名重绑到本机回环后即可同源读取学习数据）；因此**不要**把它暴露到局域网或公网
 
 ## 已知边界
 
