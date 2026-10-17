@@ -45,15 +45,16 @@ def load_server_module():
     return m
 
 
-def fresh_store(m, tmp: Path, public: bool):
-    """把模块的数据指向临时副本，返回隔离的 Store。"""
+def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
+    """把模块的数据指向临时副本，返回隔离的 Store。tag 用于 store 层与 HTTP 层各用一套文件。"""
     if public:
         m.DB = tmp / 'not-exist.sqlite'
     else:
-        shutil.copy2(ROOT / 'data' / 'qbank.sqlite', tmp / 'qbank.sqlite')
-        m.DB = tmp / 'qbank.sqlite'
-    m.PROGJSON = tmp / 'progress.json'
-    m.CKJSON = tmp / 'checkin.json'      # 手动打卡文件也要隔离，别写进真实 data/
+        shutil.copy2(ROOT / 'data' / 'qbank.sqlite', tmp / ('qbank%s.sqlite' % tag))
+        m.DB = tmp / ('qbank%s.sqlite' % tag)
+    m.PROGJSON = tmp / ('progress%s.json' % tag)
+    m.CKJSON = tmp / ('checkin%s.json' % tag)      # 手动打卡文件也要隔离，别写进真实 data/
+    m.NOTESJSON = tmp / ('notes%s.json' % tag)     # 题目备注同样隔离
     return m.Store()
 
 
@@ -233,12 +234,51 @@ def store_smoke(m, st, public: bool):
     check('历史月可查', len(ck4['days']) == calendar.monthrange(lm.year, lm.month)[1])
     ck5 = st.checkin('bad-month')
     check('非法 month 回落当月', ck5['month'] == today[:7])
-    st.con.close()
+
+    # ---- 题目备注 ----
+    check('备注：初始为空', st.notes_list() == [])
+    r1 = st.set_note(qid, '易错点：先看单位再套公式')
+    check('备注：保存成功', r1.get('ok') is True and r1.get('note') == '易错点：先看单位再套公式'
+          and bool(r1.get('updated_at')) and r1.get('removed') is False)
+    nl1 = st.notes_list()
+    check('备注：列表带题号/题干/题型（明确属于哪道题）',
+          len(nl1) == 1 and nl1[0]['id'] == qid and nl1[0]['stem'] and nl1[0]['missing'] is False
+          and nl1[0]['qtype'] == st.full(qid)['qtype'], str(nl1[:1]))
+    r2 = st.set_note(qid, '  改过的备注  ')
+    check('备注：覆盖更新并去首尾空白', r2.get('note') == '改过的备注' and r2.get('updated_at') >= r1['updated_at'])
+    check('备注：同一题只有一条', len(st.notes_list()) == 1)
+    r3 = st.set_note(qid, '')
+    check('备注：空内容 = 删除', r3.get('removed') is True and st.notes_list() == [])
+    check('备注：不存在的题号报错', st.set_note('NOPE-X', 'x').get('error') == 'not found')
+    check('备注：缺 id 报错', st.set_note('', 'x').get('error') is not None)
+    st.set_note(qid, 'a' * 3000)
+    check('备注：超长截断到 2000', len(st.notes_list()[0]['note']) == 2000)
+    # 排序：两条备注按更新时间倒序
+    qid2 = st.q('SELECT id FROM questions WHERE id != ? LIMIT 1', (qid,))[0]['id']
+    st.set_note(qid, '第一条')
+    st.set_note(qid2, '第二条')
+    st._notes()[qid]['updated_at'] = '2020-01-01T00:00:00'
+    st._notes()[qid2]['updated_at'] = '2030-01-01T00:00:00'
+    st._save_notes()
+    check('备注：按更新时间倒序', [x['id'] for x in st.notes_list()] == [qid2, qid],
+          str([x['id'] for x in st.notes_list()]))
+    # 题目不存在但备注仍在（题库换版）：标注 missing
+    st._notes()['GHOST-1'] = {'note': '孤儿备注', 'updated_at': '2099-01-01T00:00:00'}
+    st._save_notes()
+    ghost = [x for x in st.notes_list() if x['id'] == 'GHOST-1']
+    check('备注：题目不存在时标 missing 且仍列出', bool(ghost) and ghost[0]['missing'] is True
+          and ghost[0]['stem'] == '')
+    st._notes().pop('GHOST-1', None); st._save_notes()
+    # 持久化：同一 notes.json 新建 Store 仍在
+    st2 = m.Store()
+    check('备注：写入 notes.json 并可在新实例恢复',
+          [x['id'] for x in st2.notes_list()] == [qid2, qid], str([x['id'] for x in st2.notes_list()]))
+    st.con.close(); st2.con.close()
 
 
 def http_smoke(m, tmp: Path, public: bool):
     print('\n== HTTP 层：%s 模式 ==' % ('公开子集' if public else '全量库（临时副本）'))
-    st = fresh_store(m, tmp, public)
+    st = fresh_store(m, tmp, public, tag='-http')   # 与 store 层用不同文件，避免互相污染
     m.STORE = st
     srv = m.ThreadingHTTPServer(('127.0.0.1', 0), m.H)
     port = srv.server_address[1]
@@ -338,6 +378,25 @@ def http_smoke(m, tmp: Path, public: bool):
         check('历史月日历天数正确', code == 200 and len(d.get('days', [])) == calendar.monthrange(ly, lm)[1])
         code, d = jget('/api/checkin?month=bad')
         check('非法 month 回落当月', code == 200 and len(d.get('days', [])) > 0)
+
+        # 题目备注（HTTP）
+        code, d = jget('/api/notes')
+        check('GET /api/notes 初始为空', code == 200 and d.get('items') == [])
+        hid = st.q('SELECT id FROM questions LIMIT 1')[0]['id']
+        code, d = post('/api/notes', {'id': hid, 'note': 'HTTP 备注：注意单位换算'})
+        check('POST /api/notes 保存成功', code == 200 and d.get('ok') is True and d.get('id') == hid, str(d)[:120])
+        code, d = jget('/api/notes')
+        item = (d.get('items') or [{}])[0]
+        check('GET /api/notes 带题号/题干/题型', code == 200 and item.get('id') == hid
+              and bool(item.get('stem')) and bool(item.get('qtype')), str(item)[:120])
+        code, d = jget('/api/question?id=' + urllib.parse.quote(hid))
+        it = d.get('item') or {}
+        check('GET /api/question 返回单题（不含答案）', code == 200 and it.get('id') == hid
+              and 'answer' not in it, str(it)[:120])
+        code, d = post('/api/notes', {'id': hid, 'note': ''})
+        check('POST /api/notes 空内容删除', code == 200 and d.get('removed') is True)
+        code, d = post('/api/notes', {'id': 'NOPE-X', 'note': 'x'})
+        check('POST /api/notes 不存在的题号报错', code == 200 and d.get('error') == 'not found')
 
         # keep-alive：同一连接连发两个请求（按 Content-Length 读完整响应再发下一个）
         def read_response(sk):

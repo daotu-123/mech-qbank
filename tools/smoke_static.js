@@ -405,6 +405,56 @@ function synthetic() {
   ok(S7.manual_checkin().checked_today === true, '存储损坏时手动打卡仍可用（内存）');
 })();
 
+// ================= 题目备注 =================
+(function () {
+  const storage = shimStorage();
+  const S = QBankStatic.make(synthetic(), storage);
+  // 1. 空状态
+  eq(S.notes_list(), [], '备注：初始为空');
+  // 2. 保存并核对「明确属于哪道题」
+  const r1 = S.set_note('TS1', '  溢流阀是稳压用的，别和减压阀混淆  ');
+  eq([r1.ok, r1.id, r1.note, r1.removed], [true, 'TS1', '溢流阀是稳压用的，别和减压阀混淆', false], '备注：保存并去首尾空白');
+  ok(!!r1.updated_at, '备注：返回更新时间');
+  const l1 = S.notes_list();
+  eq([l1.length, l1[0].id, l1[0].qtype, l1[0].missing], [1, 'TS1', '单选', false], '备注：列表带题号与题型');
+  ok(l1[0].stem.indexOf('溢流阀') >= 0, '备注：列表带题干');
+  // 3. 覆盖更新（同一题只留一条）
+  S.set_note('TS1', '改过之后的内容');
+  eq([S.notes_list().length, S.notes_list()[0].note], [1, '改过之后的内容'], '备注：覆盖更新');
+  // 4. 多题排序（按更新时间倒序）
+  S.set_note('TM1', '多选题只记 AB 两个');
+  const l2 = S.notes_list();
+  eq(l2.length, 2, '备注：两题各一条');
+  ok(l2[0].updated_at >= l2[1].updated_at, '备注：按更新时间倒序');
+  // 5. 删除（空内容）
+  const r2 = S.set_note('TS1', '   ');
+  eq([r2.removed, S.notes_list().map(x => x.id)], [true, ['TM1']], '备注：空内容 = 删除');
+  // 6. 非法入参
+  eq(S.set_note('', 'x').error, '缺少题号 id', '备注：缺 id 报错');
+  eq(S.set_note('NOPE', 'x').error, 'not found', '备注：不存在的题号报错');
+  // 7. 超长截断
+  S.set_note('TS1', 'a'.repeat(3000));
+  eq(S.notes_list().find(x => x.id === 'TS1').note.length, 2000, '备注：超长截断到 2000');
+  // 8. 持久化：同存储新实例仍在
+  const S2 = QBankStatic.make(synthetic(), storage);
+  eq(S2.notes_list().map(x => x.id).sort(), ['TM1', 'TS1'], '备注：持久化到 localStorage');
+  eq(S2.notes_list().find(x => x.id === 'TM1').note, '多选题只记 AB 两个', '备注：内容持久化');
+  // 9. 题目不存在但备注保留（换题库场景）
+  storage.setItem(QBankStatic.NOTES_KEY, JSON.stringify({ GHOST: { note: '孤儿备注', updated_at: '2099-01-01T00:00:00' } }));
+  const S3 = QBankStatic.make(synthetic(), storage);
+  const ghost = S3.notes_list()[0];
+  eq([ghost.id, ghost.missing, ghost.stem], ['GHOST', true, ''], '备注：题目不存在时标 missing');
+  // 10. 存储损坏降级
+  const bad = { getItem: k => k === QBankStatic.NOTES_KEY ? '{坏 json' : null, setItem: () => {}, removeItem: () => {} };
+  const S4 = QBankStatic.make(synthetic(), bad);
+  eq(S4.notes_list(), [], '备注：存储损坏降级为空');
+  eq(S4.set_note('TS1', '仍可写').ok, true, '备注：存储损坏时仍可写（内存）');
+  // 11. 单题查询（备注列表「跳到该题」用）
+  const q = S.question('TS1');
+  eq([q.id, q.qtype, q.answer], ['TS1', '单选', undefined], 'question：返回单题且不含答案');
+  eq(S.question('NOPE'), null, 'question：不存在返回 null');
+})();
+
 // ---- 汇总 ----
 console.log('静态模式冒烟（qbank-static.js）：通过 %d ｜ 失败 %d', pass, fail);
 if (fail) { fails.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }

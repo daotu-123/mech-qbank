@@ -4,6 +4,7 @@ data/qbank.sqlite.new
 data/qbank.sqlite-*
 data/progress.json
 data/checkin.json
+data/notes.json
 data/private/
 源材料/
 *.bak-*

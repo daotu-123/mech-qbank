@@ -25,10 +25,13 @@ API 一览
   GET  /api/wrong      错题本（按累计错次排序）
   GET  /api/progress   导出进度 JSON
   GET  /api/checkin    学习打卡（连续天数/今日状态/当月日历；答题自动打卡，?month=YYYY-MM 看历史月）
+  GET  /api/notes      题目备注列表（按更新时间倒序；每条带题号/题干/题型，指明属于哪道题）
+  GET  /api/question   按题号取单题 ?id=（不带答案，备注列表「跳到该题」用）
   POST /api/grade      判分 {id, given}
   POST /api/mark       记录结果 {id, result: correct|wrong|skip}
   POST /api/progress   导入进度 {progress: {...}}（合并，不覆盖未出现的题）
   POST /api/checkin    手动打卡 {action: "checkin"}（答过题的日子自动算，这是补签）
+  POST /api/notes      保存题目备注 {id, note}（note 为空 = 删除该题备注）
 """
 from __future__ import annotations
 import calendar, json, os, re, sqlite3, sys, mimetypes, threading, webbrowser
@@ -49,6 +52,7 @@ DB = DATA / 'qbank.sqlite'
 PUBJSON = ASSETS / 'data' / 'public' / 'qbank.json'
 PROGJSON = DATA / 'progress.json'
 CKJSON = DATA / 'checkin.json'          # 手动打卡日期（答题打卡从 progress.last_seen 聚合）
+NOTESJSON = DATA / 'notes.json'         # 题目备注 {id: {note, updated_at}}（重建题库不丢）
 PORT = int(os.environ.get('QBANK_PORT', '8640'))
 PORT_SCAN = max(1, int(os.environ.get('QBANK_PORT_SCAN', '10')))  # 端口被占用时向后尝试的个数
 INTERVALS = [int(x) for x in os.environ.get('QBANK_INTERVALS', '1,3,7,15,30,60').replace('，', ',').split(',')
@@ -438,6 +442,67 @@ class Store:
                     pass  # 写不了就当次运行有效，不打断
         return self.checkin()
 
+    # ---- 题目备注（data/notes.json；与题库分离，重建题库不丢）----
+    NOTE_MAX = 2000
+
+    def _notes(self) -> dict:
+        if getattr(self, '_note_cache', None) is None:
+            self._note_cache = {}
+            try:
+                raw = json.loads(NOTESJSON.read_text(encoding='utf-8')) if NOTESJSON.exists() else {}
+                src = raw.get('notes') if isinstance(raw, dict) else None
+                if isinstance(src, dict):
+                    for qid, v in src.items():
+                        if isinstance(v, dict) and isinstance(v.get('note'), str) and v['note'].strip():
+                            self._note_cache[str(qid)] = {'note': v['note'],
+                                                          'updated_at': str(v.get('updated_at') or '')}
+            except Exception:
+                self._note_cache = {}   # 文件损坏降级为空，不阻塞启动
+        return self._note_cache
+
+    def _save_notes(self) -> bool:
+        try:
+            NOTESJSON.write_text(json.dumps({'notes': self._notes()}, ensure_ascii=False, indent=1),
+                                 encoding='utf-8')
+            return True
+        except OSError:
+            return False   # 写不了就当次运行有效，不打断
+
+    def notes_list(self, limit=500) -> list:
+        """每条备注都带题号/题干/题型 —— 前端据此明确「这条备注属于哪道题」。"""
+        limit = clamp_int(limit, 500, 1, 2000)
+        out = []
+        for qid, v in self._notes().items():
+            rows = self.q('SELECT id, stem, qtype, level, bank FROM questions WHERE id=?', (qid,))
+            if rows:
+                r = rows[0]
+                out.append({'id': qid, 'note': v['note'], 'updated_at': v['updated_at'],
+                            'stem': r['stem'], 'qtype': r['qtype'], 'level': r['level'],
+                            'bank': r['bank'], 'missing': False})
+            else:   # 题被删/换了题库：仍列出，但标明题目已不存在
+                out.append({'id': qid, 'note': v['note'], 'updated_at': v['updated_at'],
+                            'stem': '', 'qtype': '', 'level': None, 'bank': '', 'missing': True})
+        out.sort(key=lambda x: (x['updated_at'] or '', x['id']), reverse=True)
+        return out[:limit]
+
+    def set_note(self, qid: str, note: str) -> dict:
+        qid = (qid or '').strip()
+        if not qid:
+            return {'error': '缺少题号 id'}
+        if not self.full(qid):
+            return {'error': 'not found'}
+        note = (note or '').replace('\r\n', '\n').strip()[:self.NOTE_MAX]
+        with self.lock:
+            notes = self._notes()
+            now = now_iso()
+            if not note:
+                notes.pop(qid, None)
+                self._save_notes()
+                return {'ok': True, 'id': qid, 'note': '', 'updated_at': '', 'removed': True}
+            notes[qid] = {'note': note, 'updated_at': now}
+            self._save_notes()
+            return {'ok': True, 'id': qid, 'note': note, 'updated_at': now, 'removed': False}
+
 
 STORE: Store | None = None
 
@@ -511,6 +576,11 @@ class H(BaseHTTPRequestHandler):
                                'progress': STORE.export_progress()})
             if p == '/api/checkin':
                 return self.j(STORE.checkin(q.get('month', '')))
+            if p == '/api/notes':
+                return self.j({'items': STORE.notes_list(q.get('limit', 500))})
+            if p == '/api/question':
+                row = STORE.full(q.get('id', ''))
+                return self.j({'item': STORE._pub_row(row) if row else None})
             return self.j({'error': 'not found'}, 404)
         except Exception as e:
             return self.j({'error': str(e)}, 500)
@@ -535,6 +605,8 @@ class H(BaseHTTPRequestHandler):
                 return self.j({'ok': True, 'imported': STORE.import_progress(body.get('progress') or {})})
             if p == '/api/checkin':
                 return self.j(STORE.manual_checkin())
+            if p == '/api/notes':
+                return self.j(STORE.set_note(str(body.get('id', '')), str(body.get('note', ''))))
             return self.j({'error': 'not found'}, 404)
         except Exception as e:
             return self.j({'error': str(e)}, 500)

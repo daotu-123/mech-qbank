@@ -29,6 +29,7 @@
   var PROG_KEY = 'mech-qbank-progress';     // localStorage 键（进度按题号存）
   var CUSTOM_KEY = 'mech-qbank-custom';     // localStorage 键（导入的自定义题）
   var CKEY = 'mech-qbank-checkin';          // localStorage 键（手动打卡日期，答题打卡从 progress 聚合）
+  var NKEY = 'mech-qbank-notes';            // localStorage 键（题目备注 {id: {note, updated_at}}）
   var TRUE_SET = { '对': 1, '正确': 1, '是': 1, '√': 1, '✓': 1, 'true': 1, 't': 1, 'yes': 1, 'y': 1, '1': 1 };
   var FALSE_SET = { '错': 1, '错误': 1, '否': 1, '×': 1, '✗': 1, 'x': 1, 'false': 1, 'f': 1, 'no': 1, '0': 1, '2': 1 };
 
@@ -499,6 +500,68 @@
       return n;
     }
 
+    // ---- 题目备注（localStorage；每条带题号/题干/题型，明确属于哪道题）----
+    var NOTE_MAX = 2000;
+    function loadNotes() {
+      try {
+        var raw = storage && storage.getItem(NKEY);
+        var obj = raw ? JSON.parse(raw) : {};
+        var out = {};
+        if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+          Object.keys(obj).forEach(function (qid) {
+            var v = obj[qid];
+            if (v && typeof v.note === 'string' && v.note.trim()) {
+              out[qid] = { note: v.note, updated_at: String(v.updated_at || '') };
+            }
+          });
+        }
+        return out;
+      } catch (e) { return {}; }   // 存储损坏降级为空
+    }
+    function saveNotes(obj) {
+      try { storage && storage.setItem(NKEY, JSON.stringify(obj)); } catch (e) { /* 存满不打断 */ }
+    }
+    var noteMap = loadNotes();
+
+    function notesList() {
+      var out = [];
+      Object.keys(noteMap).forEach(function (qid) {
+        var v = noteMap[qid], q = byId[qid];
+        out.push(q
+          ? { id: qid, note: v.note, updated_at: v.updated_at, stem: q.stem, qtype: q.qtype,
+              level: q.level, bank: q.bank, missing: false }
+          : { id: qid, note: v.note, updated_at: v.updated_at, stem: '', qtype: '',
+              level: null, bank: '', missing: true });
+      });
+      out.sort(function (a, b) {
+        var ua = a.updated_at || '', ub = b.updated_at || '';
+        if (ua !== ub) return ua < ub ? 1 : -1;         // 更新时间倒序
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      });
+      return out;
+    }
+
+    function setNote(qid, note) {
+      qid = String(qid == null ? '' : qid).trim();
+      if (!qid) return { error: '缺少题号 id' };
+      if (!byId[qid]) return { error: 'not found' };
+      note = String(note == null ? '' : note).replace(/\r\n/g, '\n').trim().slice(0, NOTE_MAX);
+      if (!note) {
+        delete noteMap[qid];
+        saveNotes(noteMap);
+        return { ok: true, id: qid, note: '', updated_at: '', removed: true };
+      }
+      var now = nowIso();
+      noteMap[qid] = { note: note, updated_at: now };
+      saveNotes(noteMap);
+      return { ok: true, id: qid, note: note, updated_at: now, removed: false };
+    }
+
+    function question(qid) {
+      var q = byId[String(qid || '')];
+      return q ? pubRow(q) : null;
+    }
+
     function byIdAsc(a, b) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
 
     return { grade: grade, mark: mark, pick: pick, search: search, banks: banks, sections: sections,
@@ -507,8 +570,10 @@
              merge_questions: mergeQuestions, custom_list: customList, clear_custom: clearCustom,
              export_template: exportTemplate,
              checkin: checkin, manual_checkin: manualCheckin,
-             export_checkin: exportCheckin, import_checkin: importCheckin };
+             export_checkin: exportCheckin, import_checkin: importCheckin,
+             notes_list: notesList, set_note: setNote, question: question };
   }
 
-  return { make: make, INTERVALS: INTERVALS.slice(), WRONG_BACK: WRONG_BACK, SKIP_BACK: SKIP_BACK, PROG_KEY: PROG_KEY };
+  return { make: make, INTERVALS: INTERVALS.slice(), WRONG_BACK: WRONG_BACK, SKIP_BACK: SKIP_BACK,
+           PROG_KEY: PROG_KEY, NOTES_KEY: NKEY, CHECKIN_KEY: CKEY };
 });

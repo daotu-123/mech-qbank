@@ -120,6 +120,22 @@
   .fb.ok{background:var(--ok-weak);color:var(--ok);border:1px solid #cbe8da}
   .fb.bad{background:var(--bad-weak);color:var(--bad);border:1px solid #f6d3d0}
   .fb.info{background:var(--steel-weak);color:var(--steel-deep);border:1px solid #d8e3fb}
+  /* ---- 题目备注 ---- */
+  .note-box{margin-top:12px;border-top:1px dashed var(--line);padding-top:10px}
+  .note-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .note-tag{font-size:11.5px;font-weight:700;color:#92580a;background:var(--amber-weak);
+    padding:2px 9px;border-radius:20px}
+  .note-body{white-space:pre-wrap;font-size:14px;line-height:1.7;margin-top:7px;color:#3d4450;
+    background:#fffdf6;border:1px solid #f0e2c6;border-radius:8px;padding:9px 12px}
+  .note-item{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;background:#fff}
+  .note-item-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .note-id{font-family:Consolas,monospace;font-size:12px;font-weight:700;color:var(--steel-deep);
+    background:var(--steel-weak);padding:1px 7px;border-radius:5px;flex:none}
+  .note-stem{font-size:13px;color:#4b5563;flex:1;min-width:140px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .note-text{white-space:pre-wrap;font-size:13.5px;line-height:1.65;margin-top:6px;color:#374151}
+  .note-flag{font-size:11.5px;font-weight:700;color:#92580a;background:var(--amber-weak);
+    padding:2px 8px;border-radius:20px}
   .card-item{border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:8px;background:#fff}
   .card-item h4{margin:0 0 4px;font-size:14.5px;font-weight:600}
   .card-item p{margin:0;font-size:13.5px;color:#374151;white-space:pre-wrap}
@@ -282,6 +298,12 @@
     </div>
 
     <div class="card" style="margin-top:14px">
+      <b>我的备注</b><span class="sub" id="notes-n" style="margin-left:8px">0 条</span>
+      <div class="meta" style="margin-top:2px">每条备注都标着它属于哪道题（题号 + 题干摘要），可跳回原题或删除</div>
+      <div id="notes-list" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
       <b>难度分布</b><div id="lv-bars" style="margin-top:10px"></div>
     </div>
     <div class="card"><b>题型分布</b><div id="tp-bars" style="margin-top:10px"></div></div>
@@ -395,6 +417,9 @@ function staticApi(p, body){
   if (path === '/api/mark') return S.mark(body.id, body.result);
   if (path === '/api/checkin')
     return body ? S.manual_checkin() : S.checkin(q.get('month'));
+  if (path === '/api/notes')
+    return body ? S.set_note(body.id, body.note) : {items: S.notes_list()};
+  if (path === '/api/question') return {item: S.question(q.get('id'))};
   if (path === '/api/import_questions') {
     const r = S.merge_questions(body.questions || [], body.mode || 'skip');
     return {ok: true, added: r.added, updated: r.updated, skipped: r.skipped, rejected: r.rejected};
@@ -614,6 +639,23 @@ function renderQ(){
   const src = [q.id, q.sec, q.bank, q.source_class === '自定义' ? '自定义导入' : ''].filter(Boolean).join(' · ');
   // 选择题提交后会重渲染整卡（为了着色选项），反馈区内容按题号暂存后回填，避免题解被清掉
   const fbCur = (S.fb && S.fb[q.id]) || null;
+  const myNote = NOTES[q.id] || null;
+  const noteEditing = S.noteEdit === q.id;
+  const noteBox = noteEditing
+    ? `<div class="note-box">
+         <div class="note-head"><span class="note-tag">备注 · ${esc(q.id)}</span><span class="meta">Esc 取消</span></div>
+         <textarea id="note-ta" placeholder="写给自己看的：易错点、口诀、出处、和哪章串起来…" style="min-height:78px;margin-top:7px">${esc(myNote ? myNote.note : '')}</textarea>
+         <div class="row" style="margin-top:7px"><button class="act" id="note-save">保存备注</button><button class="ghost" id="note-cancel">取消</button></div>
+       </div>`
+    : myNote
+      ? `<div class="note-box">
+           <div class="note-head"><span class="note-tag">我的备注 · ${esc(q.id)}</span>
+             <button class="ghost" id="note-edit" style="padding:2px 10px;font-size:12.5px">编辑</button>
+             <button class="ghost" id="note-del" style="padding:2px 10px;font-size:12.5px">删除</button></div>
+           <div class="note-body">${esc(myNote.note)}</div>
+         </div>`
+      : `<div class="note-box"><button class="ghost" id="note-add">＋ 给这道题添加备注</button>
+           <span class="meta" style="margin-left:8px">备注只属于当前这道题（${esc(q.id)}），进度页可统一查看</span></div>`;
   $('#quiz-area').innerHTML = `
     <div class="card">
       <div class="q-head">
@@ -622,6 +664,7 @@ function renderQ(){
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M4 18V9M10 18V4M16 18v-6M22 18h-2"/></svg>
           ${lvKey ? '难度 ' + lvKey + ' ' + lv.name : lv.name}</span>
         <span class="q-progress">第 <b>${idx+1}</b> / ${total} 题<i class="meta" style="margin-left:8px">${esc(S.label)}</i></span>
+        ${myNote ? '<span class="note-flag">有备注</span>' : ''}
       </div>
       <div class="q-src meta">${esc(src)}</div>
       <div class="q">${esc(q.stem)}</div>
@@ -636,6 +679,7 @@ function renderQ(){
         <button class="ghost" id="next" style="margin-left:auto">下一题</button>
       </div>
       <div id="fb"${fbCur ? ` class="${fbCur.cls}"` : ''}>${fbCur ? fbCur.html : ''}</div>
+      ${noteBox}
       <div class="meta" style="margin-top:10px">${ isJudge
         ? '快捷键：<span class="kbd">1</span> 对 · <span class="kbd">2</span> 错 · <span class="kbd">T</span>/<span class="kbd">F</span> 也可 · <span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题'
         : isChoice ? '快捷键：<span class="kbd">A</span>–<span class="kbd">H</span> 或 <span class="kbd">1</span>–<span class="kbd">8</span> 选择 · <span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题'
@@ -661,6 +705,14 @@ function renderQ(){
   };
   $('#next').onclick = nextQ;
   bindSelfEval(q);   // 回填的反馈里若有自评按钮（答案待补的选择题），重渲染后重绑事件
+  // 备注区按钮
+  const nbAdd = $('#note-add'), nbEdit = $('#note-edit'), nbDel = $('#note-del'),
+        nbSave = $('#note-save'), nbCancel = $('#note-cancel');
+  if (nbAdd) nbAdd.onclick = () => { S.noteEdit = q.id; renderQ(); $('#note-ta')?.focus(); };
+  if (nbEdit) nbEdit.onclick = () => { S.noteEdit = q.id; renderQ(); $('#note-ta')?.focus(); };
+  if (nbDel) nbDel.onclick = () => { if (confirm('删除这道题（' + q.id + '）的备注？')) saveNote(q.id, ''); };
+  if (nbSave) nbSave.onclick = () => saveNote(q.id, $('#note-ta').value);
+  if (nbCancel) nbCancel.onclick = () => { S.noteEdit = null; renderQ(); };
 }
 async function submitQ(){
   const q = S.items[S.i];
@@ -742,6 +794,7 @@ function summary(){
 // ---- 键盘快捷键
 document.addEventListener('keydown', e => {
   if ($('#v-quiz').classList.contains('hide')) return;
+  if (e.key === 'Escape' && S && S.noteEdit) { e.preventDefault(); S.noteEdit = null; renderQ(); return; }
   const t = e.target;
   if (t && /INPUT|TEXTAREA|SELECT/.test(t.tagName)) return;
   const q = S.items[S.i];
@@ -973,6 +1026,66 @@ $('#ck-next').onclick = () => {
   loadCheckin();
 };
 
+// ---- 题目备注（每条都绑定题号；进度页可统一查看/跳转/删除）
+let NOTES = {};
+async function loadNotes(){
+  const r = await api('/api/notes');
+  NOTES = {};
+  ((r && r.items) || []).forEach(n => { NOTES[n.id] = n; });
+  renderNotesList();
+}
+function renderNotesList(){
+  const box = $('#notes-list');
+  if (!box) return;
+  const list = Object.values(NOTES).sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''));
+  const cnt = $('#notes-n');
+  if (cnt) cnt.textContent = list.length + ' 条';
+  if (!list.length) {
+    box.innerHTML = '<div class="meta">还没有备注。刷题时点题目下方的「＋ 给这道题添加备注」就能记下来。</div>';
+    return;
+  }
+  box.innerHTML = list.map(n => {
+    const typeChip = n.qtype
+      ? `<span class="qtype-badge" style="background:${qtMeta(n.qtype).color};font-size:11px;padding:2px 8px 2px 6px">${esc(n.qtype)}</span>`
+      : '<span class="pill gray" style="font-size:11px">题目已不存在</span>';
+    const stem = n.stem || '（该题已不在当前题库中，备注仍保留）';
+    return `<div class="note-item">
+      <div class="note-item-head">
+        <span class="note-id">${esc(n.id)}</span>${typeChip}
+        <span class="note-stem" title="${esc(stem)}">${esc(stem)}</span>
+        <button class="ghost" data-jump="${esc(n.id)}" style="padding:2px 9px;font-size:12px">跳到该题</button>
+        <button class="ghost" data-del="${esc(n.id)}" style="padding:2px 9px;font-size:12px">删除</button>
+      </div>
+      <div class="note-text">${esc(n.note)}</div>
+      <div class="meta">${n.updated_at ? '更新于 ' + esc(String(n.updated_at).replace('T', ' ').slice(0, 16)) : ''}</div>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-jump]').forEach(b => b.onclick = () => jumpToQuestion(b.dataset.jump));
+  box.querySelectorAll('[data-del]').forEach(b => b.onclick = () => {
+    if (confirm('删除「' + b.dataset.del + '」这条备注？')) saveNote(b.dataset.del, '');
+  });
+}
+async function saveNote(qid, text){
+  const r = await api('/api/notes', {id: qid, note: text});
+  if (!r || r.error) {
+    toast(r && r.error === 'not found' ? '题目不存在：' + qid : (r && r.error) || '备注保存失败', 'bad');
+    return;
+  }
+  S.noteEdit = null;
+  await loadNotes();
+  toast(r.removed ? '备注已删除' : '备注已保存（只属于 ' + qid + '）', 'ok');
+  if (S.items && S.items.length) renderQ();
+}
+async function jumpToQuestion(qid){
+  const r = await api('/api/question?id=' + encodeURIComponent(qid));
+  const item = r && r.item;
+  if (!item) { toast('题目已不存在：' + qid, 'bad'); return; }
+  S = {items: [item], i: 0, given: {}, shown: {}, res: {ok: 0, bad: 0, self: 0, skip: 0}, label: '备注 · ' + qid};
+  document.querySelector('nav button[data-v=quiz]').click();
+  renderQ();
+  document.querySelector('#quiz-area')?.scrollIntoView({block: 'start', behavior: 'smooth'});
+}
+
 // ---- 进度
 async function loadStats(){
   const s = await api('/api/stats');
@@ -1004,6 +1117,7 @@ async function loadStats(){
   $('#rule').textContent = `答对后按 ${iv} 天间隔复习；答错次日必回；跳过 3 天后回。问答题/计算题不自动判分，由你自评。`;
   refreshImportUI();
   loadCheckin();
+  loadNotes();
 }
 $('#exp').onclick = async () => {
   const r = await api('/api/progress');
@@ -1054,6 +1168,7 @@ $('#imp-text-prog').onclick = async () => {
 };
 renderConds();
 loadFilterOpts();   // 题型/难度下拉按真实题库分布即时填充（不点「开始」也能选题）
+loadNotes();        // 备注缓存：题卡显示「有备注」与备注内容、进度页备注列表
 loadStats();
 </script>
 </body>
