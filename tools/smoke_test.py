@@ -26,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import calendar
+import time as _t
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -209,7 +210,6 @@ def store_smoke(m, st, public: bool):
         st.mark(qid, 'skip')
         check('全量模式 mark() 后不触发落盘（no-op）', True)
     else:
-        import time as _t
         _t.sleep(0.05)
         st._flush_progress()
         on_disk = json.loads(m.PROGJSON.read_text(encoding='utf-8')) if m.PROGJSON.exists() else {}
@@ -486,8 +486,31 @@ def http_smoke(m, tmp: Path, public: bool):
         # POST 同样要守
         code, _d = post('/api/mark', {'id': 'TS1', 'result': 'skip'})
         check('本地 POST 正常放行', code == 200 and _d.get('ok') is True)
+        # /api/shutdown：windowed 打包没有 Ctrl+C，页面按钮靠它退出服务（放在最后测，测完服务就真关）
+        req = urllib.request.Request(base + '/api/shutdown', headers={'Host': 'evil.com'})
+        code = 0
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check('外站 Host 调 /api/shutdown → 403（关不掉服务）', code == 403, '实际 %d' % code)
+        m.SRV = srv
+        code, body = get('/api/shutdown')
+        check('本机 GET /api/shutdown → 200 ok', code == 200 and b'"ok"' in body,
+              body[:60].decode('latin1'))
+        # serve_forever 的 poll_interval=0.5，循环最多再转半圈才退：轮询等端口拒连
+        refused = False
+        for _ in range(30):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=1).close()
+                _t.sleep(0.1)
+            except OSError:
+                refused = True
+                break
+        check('/api/shutdown 后服务真正退出（端口拒连）', refused)
     finally:
-        srv.shutdown()
+        srv.shutdown()          # 已关过也安全：__is_shut_down 已 set，直接返回
         srv.server_close()
         st.con.close()
 

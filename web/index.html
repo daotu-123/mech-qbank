@@ -352,7 +352,7 @@
     </div>
   </section>
 
-  <footer>mech-qbank · 数据来自本地题库，只读源库 · 进度与自定义题库存在本机</footer>
+  <footer>mech-qbank · 数据来自本地题库，只读源库 · 进度与自定义题库存在本机<button class="ghost hide" id="quit" style="margin-left:10px;padding:3px 10px;font-size:12px;vertical-align:middle">退出程序</button></footer>
 </main>
 <div class="toast" id="toast"></div>
 <script>
@@ -447,6 +447,21 @@ function toast(msg, type){
   clearTimeout(t._h);
   t._h = setTimeout(()=>t.classList.remove('show'), 3200);
 }
+
+// 在线模式：exe 是无终端窗口的（--windowed 打包），Ctrl+C 不可用，靠这个按钮退出服务。
+// /api/shutdown 服务端有 Host 白名单，外站页面调不动；静态模式（file://）没有服务，不显示。
+(function initQuit(){
+  const b = $('#quit');
+  if (!b || STATIC) return;
+  b.classList.remove('hide');
+  b.onclick = async () => {
+    if (!confirm('退出 mech-qbank 服务？\n进度已自动保存，重新开始只需双击 mech-qbank.exe。')) return;
+    try { await fetch('/api/shutdown'); } catch (e) { /* 服务先一步断开连接，也算退出了 */ }
+    document.body.innerHTML =
+      '<p style="text-align:center;padding:48px 16px;color:var(--muted);line-height:2">' +
+      '服务已退出，可以关闭此标签页。<br>重新开始：双击 mech-qbank.exe</p>';
+  };
+})();
 function fmtDue(iso){
   const d = new Date(iso);
   if(isNaN(d)) return '';

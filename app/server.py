@@ -13,6 +13,8 @@ mech-qbank · 机械题库 App 服务端
   · 只读源库，进度写进 qbank.sqlite 的 progress 表（公开模式下写 progress.json）
   · 进度可导出/导入（GET/POST /api/progress），便于备份与换机
   · 安全：只监听 127.0.0.1，且 Host/Origin 必须在 ALLOWED_HOSTS 白名单内（挡 DNS rebinding）
+  · 打包：PyInstaller --windowed（无终端窗口），日志写 exe 同级 qbank.log；
+    关闭服务走页面「退出程序」按钮 → GET /api/shutdown（_guard() 保证只有本机能调）
 
 API 一览
   GET  /api/stats      总览（总量/已答/掌握/错题/待复习/今日/难度/题型/来源分布）
@@ -28,6 +30,7 @@ API 一览
   GET  /api/checkin    学习打卡（连续天数/今日状态/当月日历；答题自动打卡，?month=YYYY-MM 看历史月）
   GET  /api/notes      题目备注列表（按更新时间倒序；每条带题号/题干/题型，指明属于哪道题）
   GET  /api/question   按题号取单题 ?id=（不带答案，备注列表「跳到该题」用）
+  GET  /api/shutdown  退出服务（无终端窗口时的关闭方式；页面右下角按钮调用）
   POST /api/grade      判分 {id, given}
   POST /api/mark       记录结果 {id, result: correct|wrong|skip}
   POST /api/progress   导入进度 {progress: {...}}（合并，不覆盖未出现的题）
@@ -66,6 +69,64 @@ SKIP_BACK = 3    # 跳过 3 天后回
 ALLOWED_HOSTS = {'127.0.0.1', 'localhost', '[::1]'}
 TRUE_SET = {'对', '正确', '是', '√', '✓', 'true', 't', 'yes', 'y', '1'}
 FALSE_SET = {'错', '错误', '否', '×', '✗', 'x', 'false', 'f', 'no', '0', '2'}
+SRV = None          # main() 里赋值，供 /api/shutdown 用
+
+
+def _log_path() -> str:
+    """frozen 时日志放 exe 同级 qbank.log（windowed 打包没有控制台，排障全靠它）。
+    开发/测试模式返回 ''（不写文件，免得污染仓库目录）。"""
+    if not FROZEN:
+        return ''
+    try:
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'qbank.log')
+    except Exception:
+        return ''
+
+
+def _log(msg: str) -> None:
+    """统一输出：PyInstaller --windowed 打包后 sys.stdout/sys.stderr 是 None，
+    裸 print() / print(file=sys.stderr) 会直接 AttributeError 把程序打崩，所以都走这里。"""
+    if not FROZEN:
+        print(msg)
+        return
+    if sys.stdout is not None:
+        try:
+            print(msg)
+        except Exception:
+            pass
+    try:
+        with open(_log_path(), 'a', encoding='utf-8') as f:
+            f.write(msg.rstrip() + '\n')
+    except Exception:
+        pass
+
+
+def _log_exc() -> None:
+    """traceback 安全版：windowed 下 sys.stderr 为 None，裸 traceback.print_exc() 会崩。"""
+    if not FROZEN:
+        traceback.print_exc()
+        return
+    try:
+        if sys.stderr is not None:
+            traceback.print_exc()
+    except Exception:
+        pass
+    try:
+        with open(_log_path(), 'a', encoding='utf-8') as f:
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+
+
+def _alert(msg: str) -> None:
+    """windowed 模式启动失败时弹个原生消息框 —— 否则用户双击后「什么都没发生」，完全没法排障。"""
+    if not FROZEN or sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, 'mech-qbank', 0x30)   # MB_ICONWARNING
+    except Exception:
+        pass
 
 
 def now_iso() -> str:
@@ -160,8 +221,7 @@ class Store:
         except OSError:
             if self.prog_writable:  # 只提醒一次，不打断刷题
                 self.prog_writable = False
-                print('⚠ 进度文件不可写（%s），本次运行进度仅存内存' % PROGJSON, file=sys.stderr)
-
+                _log('⚠ 进度文件不可写（%s），本次运行进度仅存内存' % PROGJSON)
     # ---- 进度落盘：1 秒防抖，且不持锁 ----
     # 全量重写 2000 条进度约 3 ms / 280 KB；持锁做等于让所有 /api 请求排队等一次磁盘 I/O。
     def _flush_progress(self) -> None:
@@ -650,9 +710,18 @@ class H(BaseHTTPRequestHandler):
             if p == '/api/question':
                 row = STORE.full(q.get('id', ''))
                 return self.j({'item': STORE._pub_row(row) if row else None})
+            if p == '/api/shutdown':
+                # windowed 打包后没有控制台可按 Ctrl+C，只能从页面退出；_guard() 已保证只有本机能调
+                def _stop():
+                    try:
+                        SRV.shutdown()
+                    except Exception:
+                        pass
+                threading.Thread(target=_stop, daemon=True).start()
+                return self.j({'ok': True})
             return self.j({'error': 'not found'}, 404)
         except Exception:
-            traceback.print_exc()          # 只进控制台，别把异常原文（含库路径/SQL）回给客户端
+            _log_exc()                       # 只进控制台/日志，别把异常原文（含库路径/SQL）回给客户端
             return self.j({'error': 'internal error'}, 500)
 
     def do_POST(self):
@@ -681,7 +750,7 @@ class H(BaseHTTPRequestHandler):
                 return self.j(STORE.set_note(str(body.get('id', '')), str(body.get('note', ''))))
             return self.j({'error': 'not found'}, 404)
         except Exception:
-            traceback.print_exc()
+            _log_exc()
             return self.j({'error': 'internal error'}, 500)
 
 
@@ -704,28 +773,37 @@ atexit.register(_flush_on_exit)
 
 
 def main() -> int:
-    global STORE
-    STORE = Store()
+    global STORE, SRV
+    try:
+        STORE = Store()
+    except Exception:
+        _log_exc()
+        _alert('启动失败：数据初始化出错，详见 exe 同目录的 qbank.log')
+        return 1
     s = STORE.stats()
-    print('mech-qbank 数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'
-          % (s['mode'], s['total'], s['cards'], s['answered'], s['due']))
-    print('  来源分级：%s' % s['by_class'])
+    _log('mech-qbank 数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'
+         % (s['mode'], s['total'], s['cards'], s['answered'], s['due']))
+    _log('  来源分级：%s' % s['by_class'])
     srv = None
-    ports = [PORT + i for i in range(PORT_SCAN)]
-    for port in ports:                      # 上次没关干净时自动换端口，双击就能起
+    ports = [PORT + i for i in range(PORT_SCAN)]      # 上次没关干净时自动换端口，双击就能起
+    for port in ports:
         try:
             srv = ThreadingHTTPServer(('127.0.0.1', port), H)
             break
         except OSError:
             continue
     if srv is None:
-        print('⚠ 端口 %d–%d 都被占用了。关掉旧实例，或设 QBANK_PORT 换一个端口。'
-              % (ports[0], ports[-1]), file=sys.stderr)
+        _log('⚠ 端口 %d–%d 都被占用了。关掉旧实例，或设 QBANK_PORT 换一个端口。'
+             % (ports[0], ports[-1]))
+        _alert('端口 %d–%d 都被占用了。\n关掉旧实例（或从任务栏/任务管理器结束 mech-qbank），或设 QBANK_PORT 换端口。'
+               % (ports[0], ports[-1]))
         return 1
     actual = srv.server_address[1]
     if actual != PORT:
-        print('⚠ %d 被占用，已自动改用 %d' % (PORT, actual))
-    print('mech-qbank 已启动  http://127.0.0.1:%d' % actual)
+        _log('⚠ %d 被占用，已自动改用 %d' % (PORT, actual))
+    _log('mech-qbank 已启动  http://127.0.0.1:%d' % actual)
+    _log('  关闭方式：点页面右下角「退出程序」按钮（本程序无终端窗口）')
+    SRV = srv
     if os.environ.get('QBANK_NO_BROWSER') != '1':      # 双击 exe 时自动开界面；设 1 可关掉
         threading.Timer(0.8, lambda: webbrowser.open('http://127.0.0.1:%d/' % actual)).start()
     try:

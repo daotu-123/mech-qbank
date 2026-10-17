@@ -127,7 +127,7 @@ APK 额外能力：**导入自己的题库**（JSON，见「功能」表最后�
 
 ```bash
 build_exe.bat          # 或手动：
-pyinstaller --noconfirm --onefile --name mech-qbank ^
+pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
   --add-data "web;web" --add-data "data/public;data/public" ^
   --exclude-module tkinter app/server.py
 ```
@@ -135,6 +135,8 @@ pyinstaller --noconfirm --onefile --name mech-qbank ^
 产物 `dist\mech-qbank.exe`（约 9.7 MB，实测）：
 
 - **双击即用**：自带公开题库（76 题 + 387 知识点卡），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
+- **无终端窗口**：`--windowed` 打包，双击后只有浏览器界面；日志写 exe 同级 `qbank.log`（启动信息、异常堆栈），排查问题先看它
+- **怎么退出**：点页面右下角「退出程序」按钮（调 `GET /api/shutdown`，同样只放行本机 Host）；没有终端可按 Ctrl+C
 - **想用你自己的全量库**：把 `qbank.sqlite` 放进 exe 同级的 `data\` 目录即可，程序自动切换成全量模式（实测：2330 题）
 - 端口默认 8640，可用环境变量 `QBANK_PORT` 改；`QBANK_NO_BROWSER=1` 可关掉自动开浏览器
 - 服务**只监听 127.0.0.1**，且校验请求的 `Host`/`Origin` 必须在 `127.0.0.1` / `localhost` 白名单内 —— 用于防御 DNS rebinding 攻击（恶意网页把域名重绑到本机回环后即可同源读取学习数据）；因此**不要**把它暴露到局域网或公网
