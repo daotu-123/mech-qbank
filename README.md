@@ -9,8 +9,8 @@
 |---|---|---|---|
 | ![选择题](docs/quiz-choice.png) | ![判断题](docs/quiz-judge.png) | ![打卡](docs/checkin.png) | ![备注](docs/notes.png) |
 
-- **零第三方依赖**：服务端只用 Python 标准库（`http.server` + `sqlite3`），前端是原生 HTML/JS/CSS
-- **一套 UI 两个壳**：Windows 双击 `start.bat` 即用（在线模式）；同一份 `web/` 也能塞进 Android WebView 壳出 APK（file:// 静态模式：数据内联成 `qbank-data.js`，进度存 localStorage，飞行模式可用）
+- **前后端分离**：前端 Vue 3 + Element Plus（`web/`，Vite 构建），后端 FastAPI（`app/api.py`，RESTful API）；另保留零依赖的标准库版 `app/server.py` 供无 pip 环境使用，两边共用 `app/core.py` 数据层（判分与排期行为由 `tools/smoke_parity.py` 差分守护）
+- **一套 UI 两个壳**：Windows 双击 `start.bat` 即用（在线模式）；同一份 `web/dist` 也能塞进 Android WebView 壳出 APK（file:// 静态模式：数据内联成 `qbank-data.js`，进度存 localStorage，飞行模式可用）
 - **不做 LLM 批改**：选择题/判断题本地自动判分，问答类给出参考答案由你自评（无 key、无联网、无隐私外泄）
 - **数据与代码分离**：题库淬成一个 `qbank.sqlite`，App 只读它
 
@@ -23,18 +23,22 @@ export QBANK_SRC=/path/to/your/qbank      # Windows: set QBANK_SRC=D:\your\qbank
 python tools/qbank_build.py
 
 # 2) 冒烟测试（不依赖浏览器；全量模式用临时副本，不碰真实数据）
-python tools/smoke_test.py            # 服务端全量模式（收尾自动跑前后端一致性）
-python tools/smoke_test.py --public   # 服务端公开子集模式
+python tools/smoke_test.py            # 数据层 + server.py 老路由（全量模式）
+python tools/smoke_test.py --public   # 同上，公开子集模式
+python tools/smoke_api.py             # FastAPI RESTful 层（用 .venv-build 解释器跑）
 node tools/smoke_static.js            # APK 静态模式（纯前端 Store，需 Node）
 python tools/audit_types.py           # 题型审查：结构自洽性核对（有问题退出码 1）
 python tools/smoke_parity.py          # 前后端判分/排期一致性（需 Node；缺 Node 时跳过）
 
-# 3) 启动
-python app/server.py        # 或 Windows 双击 start.bat
-# → http://127.0.0.1:8640
+# 3) 前端构建（Vite → web/dist；file:// 离线模式与 exe/APK 都用这份产物）
+cd web && npm install && npm run build && cd ..
+
+# 4) 启动（FastAPI 栈；start.bat 会自动建 .venv-build 并装依赖）
+.venv-build/Scripts/python.exe app/api.py     # 或 Windows 双击 start.bat
+# → http://127.0.0.1:8640（前端开发可 cd web && npm run dev，代理到 8640）
 ```
 
-要求 Python 3.10+，无 pip 依赖。环境变量：`QBANK_SRC` 源题库目录、`QBANK_PORT` 改端口（被占用时自动顺延，`QBANK_PORT_SCAN` 控制尝试个数）、`QBANK_NO_BROWSER=1` 关自动开浏览器、`QBANK_INTERVALS` 自定义复习间隔（默认 `1,3,7,15,30,60`；会同时写进 `web/qbank-data.js`，离线端按同一套排期）。
+要求 Python 3.10+；FastAPI 栈依赖 `fastapi` / `uvicorn`（`start.bat` 自动装进 `.venv-build`），前端构建需要 Node 18+。环境变量：`QBANK_SRC` 源题库目录、`QBANK_PORT` 改端口（被占用时自动顺延，`QBANK_PORT_SCAN` 控制尝试个数）、`QBANK_NO_BROWSER=1` 关自动开浏览器、`QBANK_INTERVALS` 自定义复习间隔（默认 `1,3,7,15,30,60`；会同时写进 `web/public/qbank-data.js`，离线端按同一套排期）。
 
 ## 功能
 
@@ -64,22 +68,28 @@ python app/server.py        # 或 Windows 双击 start.bat
 
 ```
 mech-qbank/
-├ app/server.py            服务端（标准库，零依赖）
-├ web/index.html           单页 UI（原生 JS；file:// 下自动切静态模式）
-├ web/qbank-static.js      静态模式纯前端 Store（判分/间隔逻辑与服务端同源）
-├ web/qbank-data.js        静态模式内置数据（tools/make_webdata.py 生成，勿手改）
-├ tools/qbank_build.py     数据构建器：md/json → qbank.sqlite + 公开子集 + 构建报告
-├ tools/make_webdata.py    公开子集 → qbank-data.js（写前重跑三道闸）
-├ tools/smoke_test.py      冒烟测试：服务端全链路（全量/公开两种模式）
-├ tools/smoke_static.js    冒烟测试：静态模式 Store（Node 运行）
-├ tools/smoke_parity.py    前后端判分/排期一致性差分测试（改判分逻辑必跑）
-├ tools/audit_types.py     题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
+├ app/core.py             数据层（判分/排期/打卡/备注，server.py 与 api.py 共用）
+├ app/api.py              服务端（FastAPI + uvicorn，RESTful /api/v1/*，主入口）
+├ app/server.py           服务端（标准库 http.server，零依赖备选，老路由）
+├ web/                    前端工程（Vue 3 + Element Plus + Vite）
+│ ├ src/                  组件/视图/store/api/router
+│ ├ public/qbank-data.js  静态模式内置数据（tools/make_webdata.py 生成，勿手改）
+│ ├ dist/                 Vite 构建产物（index.html + assets/，随库提交）
+│ └ vite.config.js        file:// 双闸：IIFE 单包 + 入口标签改写（见 web/README.md）
+├ tools/qbank_build.py    数据构建器：md/json → qbank.sqlite + 公开子集 + 构建报告
+├ tools/make_webdata.py   公开子集 → web/public/qbank-data.js（写前重跑三道闸）
+├ tools/smoke_test.py     冒烟测试：数据层 + server.py 老路由（全量/公开两种模式）
+├ tools/smoke_static.js   冒烟测试：静态模式 Store（Node 运行）
+├ tools/smoke_parity.py   前后端判分/排期一致性差分测试（改判分逻辑必跑）
+├ tools/smoke_api.py      冒烟测试：FastAPI RESTful 契约（方法/状态码/白名单/shutdown）
+├ tools/audit_types.py    题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
 │ └ public/qbank.json    公开子集（示例数据，入库）
-├ docs/                    界面截图（README 展示用）
-├ start.bat                Windows 启动器（纯 ASCII）
-└ BUILD_REPORT.md          构建报告（本地生成，不入库）
+├ docs/                   界面截图（README 展示用）
+├ build_exe.bat           PyInstaller 打包（api.py + web/dist，纯 ASCII）
+├ start.bat               Windows 启动器（自动建 .venv-build，纯 ASCII）
+└ BUILD_REPORT.md         构建报告（本地生成，不入库）
 ```
 
 > 构建器与 `make_webdata.py` 共用同一套「来源分级 + 污染检测」规则；与具体公司相关的来源标记不写在开源代码里，需要时放在 `data/private/taint-extra.txt`（每行一个词，已被 `.gitignore` 排除）。
@@ -119,24 +129,27 @@ mech-qbank/
 
 ## 手机 APK（静态离线模式）
 
-`web/` 是同一份 UI：检测到 `file://` 协议时自动切静态模式 —— 数据由 `tools/make_webdata.py` 从公开子集生成 `qbank-data.js`（`window.QBANK_DATA`）经 `<script>` 标签内联加载（file:// 页面不能 fetch 本地 JSON，会被 CORS 拦），判分与复习间隔逻辑在 `web/qbank-static.js` 中与服务端同源实现，进度存 localStorage。把 `web/` 下三个文件（`index.html`、`qbank-data.js`、`qbank-static.js`）放进任意 WebView 壳的 assets 目录即可离线刷题；改公开题库后重跑 `make_webdata.py` 再拷贝即可。
+`web/dist/` 是同一份 UI：检测到 `file://` 协议时自动切静态模式 —— 数据由 `tools/make_webdata.py` 从公开子集生成 `qbank-data.js`（`window.QBANK_DATA`）经 `<script>` 标签加载（file:// 页面不能 fetch 本地 JSON，会被 CORS 拦），判分与复习间隔逻辑在前端 `web/src/store/static-store.js` 中与服务端同源实现，进度存 localStorage。把 `web/dist/` 整个目录（`index.html` + `assets/` + `qbank-data.js`）放进任意 WebView 壳的 assets 目录即可离线刷题；改公开题库后重跑 `make_webdata.py` 与 `npm run build` 再拷贝即可。注意 dist 的入口脚本是经典 script（IIFE 单包）——`type="module"` 在 file:// 下会被 CORS 拦，详见 `web/README.md`。
 
 APK 额外能力：**导入自己的题库**（JSON，见「功能」表最后一条）—— 公开子集以问答/计算题为主，选择题靠用户导入补充；导入题与内置题同权。参考实现为一个克隆自通用 WebView 壳的 Android 工程（applicationId `com.xinghui.mechqbank`，minSdk 26 / targetSdk 34），图标为齿轮+对勾矢量图（`drawable/ic_launcher_foreground.xml`）。
 
 ## 打包 Windows exe（免装 Python）
 
 ```bash
-build_exe.bat          # 或手动：
+build_exe.bat          # 或手动（先 cd web && npm run build 产出 web/dist）：
 pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
-  --add-data "web;web" --add-data "data/public;data/public" ^
-  --exclude-module tkinter app/server.py
+  --add-data "web/dist;web/dist" --add-data "data/public;data/public" ^
+  --hidden-import uvicorn.protocols.http.httptools_impl ^
+  --hidden-import uvicorn.protocols.websockets.websockets_impl ^
+  --hidden-import uvicorn.lifespan.on ^
+  --exclude-module tkinter app/api.py
 ```
 
-产物 `dist\mech-qbank.exe`（约 9.7 MB，实测）：
+产物 `dist\mech-qbank.exe`（约 18 MB，实测）：
 
 - **双击即用**：自带公开题库（76 题 + 387 知识点卡），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
 - **无终端窗口**：`--windowed` 打包，双击后只有浏览器界面；日志写 exe 同级 `qbank.log`（启动信息、异常堆栈），排查问题先看它
-- **怎么退出**：点页面右下角「退出程序」按钮（调 `GET /api/shutdown`，同样只放行本机 Host）；没有终端可按 Ctrl+C
+- **怎么退出**：点页面右下角「退出程序」按钮（调 `POST /api/v1/system/shutdown`，同样只放行本机 Host）；没有终端可按 Ctrl+C
 - **想用你自己的全量库**：把 `qbank.sqlite` 放进 exe 同级的 `data\` 目录即可，程序自动切换成全量模式（实测：2330 题）
 - 端口默认 8640，可用环境变量 `QBANK_PORT` 改；`QBANK_NO_BROWSER=1` 可关掉自动开浏览器
 - 服务**只监听 127.0.0.1**，且校验请求的 `Host`/`Origin` 必须在 `127.0.0.1` / `localhost` 白名单内 —— 用于防御 DNS rebinding 攻击（恶意网页把域名重绑到本机回环后即可同源读取学习数据）；因此**不要**把它暴露到局域网或公网
@@ -153,8 +166,9 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
 - [x] PyInstaller 打包 Windows exe（双击即用，免装 Python）
 - [x] 导入/导出学习进度（JSON），多设备手动同步
 - [x] 间隔重复算法可配置（`QBANK_INTERVALS`，默认 1/3/7/15/30/60 天）
-- [x] 冒烟测试（`tools/smoke_test.py`，数据层 + HTTP 全链路）
+- [x] 冒烟测试（`tools/smoke_test.py` 数据层 + HTTP 全链路；`tools/smoke_api.py` RESTful 契约）
 - [x] Android WebView 壳出 APK（file:// 静态模式：`qbank-data.js` 内联公开子集 + localStorage 进度，飞行模式可用；`tools/make_webdata.py` 重新生成数据）
 - [x] APK 导入自定义题库（JSON 导入 + 模板 + 去重/覆盖 + 拒绝撞内置题号）
 - [x] UI 重设计：题型/难度徽章、条件 chips 预览、动态题型下拉、齿轮品牌图标
 - [x] 学习打卡：答题自动打卡 + 手动补签 + 连续天数 + 月历记录（静态模式存 localStorage，在线模式存 `data/checkin.json`）
+- [x] 架构迁移：前端 Vue 3 + Element Plus（Vite，`web/`），后端 FastAPI RESTful（`app/api.py`），数据层抽成 `app/core.py` 两端共用；file:// 双模式保留（IIFE 单包 + 入口标签改写），判分/排期由 `smoke_parity.py` 差分守护

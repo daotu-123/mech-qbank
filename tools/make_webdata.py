@@ -5,7 +5,7 @@ make_webdata.py — 把公开子集压成 APK 可直接加载的 JS 数据文件
 为什么需要它
   WebView 里 file:///android_asset/www/index.html 用 fetch 读本地 JSON 会被 CORS 拦
   （file 协议不支持跨源 XHR）→ 把公开子集内联成 <script src="qbank-data.js"> 加载的
-  JS 变量 window.QBANK_DATA，配 web/qbank-static.js 即可完全离线刷题。
+  JS 变量 window.QBANK_DATA，配 web/src/store/static-store.js 即可完全离线刷题。
 
 输入   data/public/qbank.json（tools/qbank_build.py 生成的公开子集）
 输出   web/qbank-data.js（window.QBANK_DATA = {...}，约 200KB，随仓库提交）
@@ -28,8 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qbank_build import PUBLIC_CLASSES, clean as pub_clean  # noqa: E402  复用三道闸，防规则漂移
 
 SRC = ROOT / 'data' / 'public' / 'qbank.json'
-OUT = ROOT / 'web' / 'qbank-data.js'
-PROG_KEY = 'mech-qbank-progress'   # 与 web/qbank-static.js 的 localStorage 键一致
+OUT = ROOT / 'web' / 'public' / 'qbank-data.js'   # vite public/：构建时原样拷进 dist/
+PROG_KEY = 'mech-qbank-progress'   # 与 web/src/store/static-store.js 的 localStorage 键一致
 
 
 def main() -> int:
@@ -95,7 +95,7 @@ def main() -> int:
           % (len(payload['questions']), len(payload['cards']),
              '/'.join(str(x) for x in payload['intervals']),
              OUT.stat().st_size / 1024, payload['generated_at']))
-    print('  进度存储键：%s（localStorage，见 web/qbank-static.js）' % PROG_KEY)
+    print('  进度存储键：%s（localStorage，见 web/src/store/static-store.js）' % PROG_KEY)
     return 0
 
 

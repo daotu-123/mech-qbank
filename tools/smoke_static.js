@@ -10,10 +10,12 @@
  *         localStorage 持久化（换实例不丢）、真实公开子集体检
  *
  * 运行：node tools/smoke_static.js
+ * 说明：Store 已从 web/qbank-static.js（UMD）迁到 web/src/store/static-store.js（ES module，
+ *      供 vite 打包与 node 无头测试共用）。Node ≥22.12 可直接 require() ESM。
  */
 'use strict';
 const path = require('path');
-const QBankStatic = require(path.join(__dirname, '..', 'web', 'qbank-static.js'));
+const QBankStatic = require(path.join(__dirname, '..', 'web', 'src', 'store', 'static-store.js'));
 const PUB = require(path.join(__dirname, '..', 'data', 'public', 'qbank.json'));
 
 let pass = 0, fail = 0;
@@ -456,5 +458,5 @@ function synthetic() {
 })();
 
 // ---- 汇总 ----
-console.log('静态模式冒烟（qbank-static.js）：通过 %d ｜ 失败 %d', pass, fail);
+console.log('静态模式冒烟（static-store.js）：通过 %d ｜ 失败 %d', pass, fail);
 if (fail) { fails.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }

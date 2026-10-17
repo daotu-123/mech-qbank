@@ -3,7 +3,7 @@ r"""
 smoke_parity.py — 前后端判分/排期一致性差分测试。
 
 为什么存在
-  app/server.py 的 Store.grade() 与 web/qbank-static.js 的 grade() 是两份手抄实现
+  app/core.py 的 Store.grade() 与 web/src/store/static-store.js 的 grade() 是两份手抄实现
   （Python + JavaScript，分别服务 http:// 服务端与 file:// APK 离线模式）。
   注释里写着「改动必须两边同步」——靠人记住的约束等于没有约束。
   本工具把这句话变成一条断言：任一端改了正则/集合/阈值，几秒内在这里炸出来。
@@ -68,7 +68,7 @@ def load_questions(public: bool, quick: bool) -> list:
 
 
 def run_js(node: str, questions: list, intervals: list) -> dict:
-    """在 Node 里跑 qbank-static.js，返回 {qid: {given:[correct,self,answer], _due:[...]}}。"""
+    """在 Node 里跑 web/src/store/static-store.js，返回 {qid: {given:[correct,self,answer], _due:[...]}}。"""
     tmp = Path(tempfile.mkdtemp(prefix='qbank-parity-'))
     try:
         (tmp / 'in.json').write_text(
@@ -98,7 +98,7 @@ for (var i = 0; i < d.questions.length; i++) {
 }
 fs.writeFileSync(process.argv[4], JSON.stringify(out), 'utf-8');
 ''', encoding='utf-8')
-        subprocess.run([node, str(tmp / 'run.js'), str(ROOT / 'web' / 'qbank-static.js'),
+        subprocess.run([node, str(tmp / 'run.js'), str(ROOT / 'web' / 'src' / 'store' / 'static-store.js'),
                         str(tmp / 'in.json'), str(tmp / 'out.json')], check=True)
         return json.loads((tmp / 'out.json').read_text(encoding='utf-8'))
     finally:
@@ -158,7 +158,7 @@ def main() -> int:
 
     st.con.close()
     if bad_grade or bad_due:
-        print('\n✗ 两端不一致 —— 改 server.py 或 qbank-static.js 时必须同步另一端')
+        print('\n✗ 两端不一致 —— 改 core.py 或 static-store.js 时必须同步另一端')
         return 1
     print('✓ 两端判分与排期完全一致（间隔 %s 天）' % '/'.join(str(x) for x in iv))
     return 0

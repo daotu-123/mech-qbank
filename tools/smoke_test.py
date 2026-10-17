@@ -40,6 +40,10 @@ def check(name: str, cond: bool, detail: str = ''):
 
 
 def load_server_module():
+    # server.py 现在 `from core import ...`：core.py 在同目录，先把它加进 sys.path
+    appdir = str(ROOT / 'app')
+    if appdir not in sys.path:
+        sys.path.insert(0, appdir)
     spec = importlib.util.spec_from_file_location('qbank_server_smoke', ROOT / 'app' / 'server.py')
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
@@ -47,15 +51,22 @@ def load_server_module():
 
 
 def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
-    """把模块的数据指向临时副本，返回隔离的 Store。tag 用于 store 层与 HTTP 层各用一套文件。"""
+    """把模块的数据指向临时副本，返回隔离的 Store。tag 用于 store 层与 HTTP 层各用一套文件。
+
+    路径常量（DB/PROGJSON/CKJSON/NOTESJSON）现在定义在 core 模块上，Store 运行期读的是
+    core 的名字，所以两处都要改；只改 server/api 模块的名字不生效（2026-10-17 core 抽取后踩过）。
+    """
     if public:
-        m.DB = tmp / 'not-exist.sqlite'
+        paths = {'DB': tmp / 'not-exist.sqlite'}
     else:
-        shutil.copy2(ROOT / 'data' / 'qbank.sqlite', tmp / ('qbank%s.sqlite' % tag))
-        m.DB = tmp / ('qbank%s.sqlite' % tag)
-    m.PROGJSON = tmp / ('progress%s.json' % tag)
-    m.CKJSON = tmp / ('checkin%s.json' % tag)      # 手动打卡文件也要隔离，别写进真实 data/
-    m.NOTESJSON = tmp / ('notes%s.json' % tag)     # 题目备注同样隔离
+        paths = {'DB': tmp / ('qbank%s.sqlite' % tag)}
+        shutil.copy2(ROOT / 'data' / 'qbank.sqlite', paths['DB'])
+    paths.update({'PROGJSON': tmp / ('progress%s.json' % tag),      # 隔离，别写进真实 data/
+                  'CKJSON': tmp / ('checkin%s.json' % tag),        # 手动打卡同样隔离
+                  'NOTESJSON': tmp / ('notes%s.json' % tag)})      # 题目备注同样隔离
+    for k, v in paths.items():
+        setattr(m.core, k, v)
+        setattr(m, k, v)
     return m.Store()
 
 

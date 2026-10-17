@@ -28,6 +28,11 @@ build/
 *.apk
 *.apk.idsig
 
+# ---- 前端（vite）----
+node_modules/
+# web/dist 是 vite 构建产物，但 exe/APK 打包依赖它，与旧版「单文件即产物」一致，随库提交
+!web/dist/
+
 # ---- 本机交接文档（含本机绝对路径，勿随公开仓发布）----
 技术文档.md
 tools/qbank_src.txt
