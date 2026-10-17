@@ -26,6 +26,7 @@ python tools/qbank_build.py
 python tools/smoke_test.py            # 服务端全量模式
 python tools/smoke_test.py --public   # 服务端公开子集模式
 node tools/smoke_static.js            # APK 静态模式（纯前端 Store，需 Node）
+python tools/audit_types.py           # 题型审查：结构自洽性核对（有问题退出码 1）
 
 # 3) 启动
 python app/server.py        # 或 Windows 双击 start.bat
@@ -70,6 +71,7 @@ mech-qbank/
 ├ tools/make_webdata.py    公开子集 → qbank-data.js（写前重跑三道闸）
 ├ tools/smoke_test.py      冒烟测试：服务端全链路（全量/公开两种模式）
 ├ tools/smoke_static.js    冒烟测试：静态模式 Store（Node 运行）
+├ tools/audit_types.py     题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
 │ └ public/qbank.json    公开子集（示例数据，入库）
@@ -92,7 +94,7 @@ mech-qbank/
     "section_path": "Python · 题库 › 基础语法",  // 章节来源路径，供 App 按来源筛选
     "cat_name": "基础语法",
     "stem": "题干……",
-    "qtype": "单选|多选|判断|问答|计算|识记",
+    "qtype": "判断|单选|多选|填空|问答|计算|识记|综合",   // 由结构证据自动定：有选项=选择、答案是 对/错=判断、空白=填空
     "level": 1,                 // 1–5 难度
     "options": ["A. ……", "B. ……"],
     "answer": "B",              // 判断题为「对/错」；问答类为要点文本

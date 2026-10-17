@@ -37,9 +37,10 @@ def _resolve_src() -> Path:
         return Path(env).expanduser()
     loc = Path(__file__).resolve().parent / 'qbank_src.txt'
     try:
-        line = loc.read_text(encoding='utf-8').strip().strip('"').strip("'")
-        if line and not line.startswith('#'):
-            return Path(line).expanduser()
+        for ln in loc.read_text(encoding='utf-8').splitlines():
+            ln = ln.strip().strip('"').strip("'")
+            if ln and not ln.startswith('#'):
+                return Path(ln).expanduser()
     except OSError:
         pass
     for cand in (ROOT / '源材料', Path.cwd() / '源材料'):
@@ -102,11 +103,12 @@ RE_CARD = re.compile(r'^\s*-\s*\[[ xX]\]\s*\*\*(?P<name>[^*]+?)\*\*\s*(?:—|–
 
 def infer_type(stem: str, options: list[str], meta: str) -> str:
     # 先看疑问词：`…有哪些（　）` 是问答，不是判断（2026-10-10 踩过 Q2085 被误判成判断题）
+    has_opts = len(options) >= 2          # 1 个残片不算选择题（2026-10-17 修）
     if re.search(r'哪些|什么|为什么|如何|怎样|简述|说明|请|计算|区别|比较|列举', stem):
-        return '问答' if not options else '单选'
+        return '问答' if not has_opts else '单选'
     if re.search(r'（\s*　*\s*）|（\s*）', stem):
-        return '判断' if len(options) <= 2 else '单选'
-    if len(options) >= 2:
+        return '填空'          # 有空格默认是填空题；判断题只认显式标注或 对/错 答案（2026-10-17 修）
+    if has_opts:
         return '多选' if '多选' in meta else '单选'
     if re.search(r'[？?]$|请|说明|简述|为什么|如何|计算', stem):
         return '问答'
@@ -117,14 +119,143 @@ def split_options(line: str) -> list[str]:
     也可能每个选项一行 → 统一按 A/B/C… 标记切开（2026-10-10 实测 504 行是挤在一行的）。
     兼容小写字母（c．）、无空格（D.BS）与全角句号，字母统一大写归一（2026-10-16 补）。"""
     s = re.sub(r'^\s*-+\s*', '', line.strip())
-    parts = re.split(r'\s*(?=[A-Ha-h][.、．]\s*)', s)
+    parts = re.split(r'\s*(?=[A-Ha-h][.、．:：)）]\s*)', s)
     out = []
     for p in parts:
         p = p.strip(' 　')
-        if p and re.match(r'^[A-Ha-h][.、．]', p):
-            out.append(re.sub(r'^([A-Ha-h])(?=[.、．])', lambda m: m.group(1).upper(), p))
+        if p and re.match(r'^[A-Ha-h][.、．:：)）]', p):
+            out.append(re.sub(r'^([A-Ha-h])(?=[.、．:：)）])', lambda m: m.group(1).upper(), p))
     return out or ([s] if s else [])
 
+
+TF_OPT = re.compile(r'^(?:[A-H][、.．]\s*)?(对|错|正确|错误|√|×|✓|✗)[。.]?$')
+
+def is_tf_options(opts) -> bool:
+    """两个选项且都是「对/错」→ 带选项判断题（判分走选项文本映射，不能当普通选择题）。"""
+    return len(opts) == 2 and all(TF_OPT.match(str(o).strip()) for o in opts)
+
+# ---- 选项/答案的「脏格式」归一（2026-10-17 题型审查后补）----
+# 公司真题区把选项写成全角字母、A: 冒号、A）括号、制表符分隔，甚至塞进题干尾部或「题干补充」行
+FW_LETTER = str.maketrans('ＡＢＣＤＥＦＧＨａｂｃｄｅｆｇｈ', 'ABCDEFGHabcdefgh')
+OPT_MARK = re.compile(r'(?:^|[\s　\t])([A-Ha-h])\s*[、.．:：)）]\s*')
+ANS_LETTER = re.compile(r'(?:答案|参考答案)\s*[：:]\s*([A-Ha-h](?:\s*[、,，]?\s*[A-Ha-h])*)')
+
+def ascii_fw(s: str) -> str:
+    """全角字母 → 半角（`Ｂ、` → `B、`），否则选项标记识别不到。"""
+    return (s or '').translate(FW_LETTER)
+
+def split_loose_options(text: str):
+    """更松的分列：`A改变泵的转速  B改变叶轮外径 …`（字母紧贴文字）或 `A 材料  B 基本尺寸 …`。
+    要求字母从 A 起连续、≥3 个、每段 ≤40 字，防止把正文切碎。"""
+    t = ascii_fw(text or '').replace('**', '')
+    m = ANS_LETTER.search(t)
+    ans, body = '', t
+    if m:
+        ans = re.sub(r'[^A-Ha-h]', '', m.group(1)).upper()
+        body = t[:m.start()]
+    starts = list(re.finditer(r'(?:^|[\s　\t])([A-H])(?=\s*[\u4e00-\u9fffA-Za-z0-9＋+±~～－-])', body))
+    letters = [x.group(1) for x in starts]
+    if len(starts) < 3 or letters != [chr(65 + i) for i in range(len(letters))]:
+        return [], ''
+    opts = []
+    for i, x in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(body)
+        seg = body[x.end():end].strip(' 　\t:：')
+        if not seg or len(seg) > 40:
+            return [], ''
+        opts.append(letters[i] + '、' + seg)
+    return opts, ans
+
+def split_inline_options(text: str):
+    """选项挤在一行且带答案：`A、下面  B、上面  C、侧面  D、两端面 答案：C` → (['A、下面',…], 'C')。
+    兼容全角字母、`A:` `A）` 分隔、制表符；字母必须从 A 连续且每段非空，否则放弃。"""
+    t = ascii_fw(text or '')
+    m = ANS_LETTER.search(t)
+    ans, body = '', t
+    if m:
+        ans = re.sub(r'[^A-Ha-h]', '', m.group(1)).upper()
+        body = t[:m.start()]
+    starts = list(OPT_MARK.finditer(body))
+    if len(starts) < 2:
+        return [], ''
+    letters = [x.group(1).upper() for x in starts]
+    if letters != [chr(65 + i) for i in range(len(letters))]:
+        return [], ''
+    opts = []
+    for i, x in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(body)
+        seg = body[x.end():end].strip(' 　\t')
+        if not seg:
+            return [], ''
+        opts.append(letters[i] + '、' + seg)
+    return opts, ans
+
+def split_plain_options(text: str):
+    """`A 材料　　B 基本尺寸　　C 加工方法　　D 装配方法`（无标点，空格分列）。
+    要求 ≥3 个连续字母且每段较短，避免把正文切坏。"""
+    t = ascii_fw(text or '')
+    starts = list(re.finditer(r'(?:^|[\s　\t])([A-H])\s+', t))
+    letters = [x.group(1) for x in starts]
+    if len(starts) < 3 or letters != [chr(65 + i) for i in range(len(letters))]:
+        return []
+    opts = []
+    for i, x in enumerate(starts):
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(t)
+        seg = t[x.end():end].strip(' 　\t')
+        if not seg or len(seg) > 40:
+            return []
+        opts.append(letters[i] + '、' + seg)
+    return opts
+
+def split_options_in_stem(stem: str):
+    """题干尾部塞选项：`…（ A ）固定，而不能实现（ ）固定。 A．周向 轴向 B．… D．以上都不正确`
+    → (去掉选项的题干, 选项列表)。逐个候选 A 标记尝试，避免把题干里的「（ A ）」当成选项起点。"""
+    t = ascii_fw(stem or '')
+    for m in re.finditer(r'(?:^|[\s　）)])(A\s*[.．、:：)）])\s*', t):
+        head = t[:m.start(1)].strip()
+        tail = t[m.start(1):].strip()
+        opts, _ = split_inline_options(tail)
+        if len(opts) >= 2 and len(head) >= 6:
+            return head, opts
+    return stem, []
+
+def letter_in_answer(ans: str) -> str:
+    """从 `选C：1.33…`、`（ A ）` 这类答案文本里取字母。"""
+    s = ascii_fw(ans or '')
+    m = re.search(r'选\s*([A-Ha-h])\s*(?:[：:、.．]|$)', s)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r'[（(]\s*([A-Ha-h])\s*[）)]', s)
+    if m:
+        return m.group(1).upper()
+    return ''
+
+def letter_by_option_text(ans: str, opts) -> str:
+    """答案写的是文字时，按「选项文本出现在答案里」反查字母；必须唯一命中，宁缺勿错。"""
+    s = ascii_fw(ans or '')
+    hits = []
+    for o in opts:
+        txt = re.sub(r'^[A-Ha-h]\s*[、.．:：)）]\s*', '', ascii_fw(str(o))).strip().rstrip('_')
+        if len(txt) >= 2 and txt in s:
+            hits.append(ascii_fw(str(o))[0].upper())
+    return hits[0] if len(hits) == 1 else ''
+
+CANON = (('判断', '判断'), ('单选', '单选'), ('多选', '多选'), ('填空', '填空'), ('计算', '计算'),
+         ('识记', '识记'), ('简答', '问答'), ('名词解释', '问答'), ('画图', '画图'),
+         ('编程', '编程'), ('综合', '综合'), ('选择', '单选'), ('问答', '问答'))
+
+def canon_type(mark: str) -> str:
+    """把 `计算/问答`、`问答/选型`、`种子题·问答/计算`、`本周综合题` 这类复合标注归一到主类型。
+    只取第一个能识别的段：`计算/问答`→计算、`问答/对比`→问答、`种子题·问答/计算`→问答。"""
+    s = (mark or '').strip()
+    if not s:
+        return ''
+    for seg in re.split(r'[·/＋+]', s):
+        seg = seg.strip()
+        for k, v in CANON:
+            if k in seg:
+                return v
+    return ''
 
 def norm_answer(a: str, choice: bool = False) -> str:
     """把 `**A**（单选·标准答案…）`、`答案：（√） 正确：大` 这类原文归一成可判分的 `对`/`错`/`A`/`AB`；
@@ -132,10 +263,18 @@ def norm_answer(a: str, choice: bool = False) -> str:
     原文答案由调用方挪进题解保留，信息不丢。"""
     if not a: return ''
     s = a.strip().replace('**', '').replace('__', '').strip()
-    if re.search(r'[（(]\s*[√✓对]\s*[）)]', s) or re.match(r'^[√✓对]', s): return '对'
-    if re.search(r'[（(]\s*[×✗xX错]\s*[）)]', s) or re.match(r'^[×✗错]', s): return '错'
+    # 注意用 fullmatch/带标点匹配：「对称布置…」这类长答案不能因为首字是「对」就被判成判断题
+    if re.search(r'[（(]\s*[√✓对]\s*[）)]', s) or re.fullmatch(r'[√✓对][。.]?', s) or re.match(r'^[√✓对]\s*[。.：:]', s): return '对'
+    if re.search(r'[（(]\s*[×✗xX错]\s*[）)]', s) or re.fullmatch(r'[×✗错][。.]?', s) or re.match(r'^[×✗错]\s*[。.：:]', s): return '错'
     m = re.search(r'(?:答案|参考答案)[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)', s)
     if m: return m.group(1).replace(' ', '').replace('，', ',')
+    # `选C：…` / `选 A：…` / 题干里的 `（ A ）` → 提取字母（2026-10-17 补）
+    m = re.search(r'选\s*([A-Ha-h])\s*(?:[：:、.．]|$)', ascii_fw(s))
+    if m: return m.group(1).upper()
+    # 只认短答案里的「（A）」，避免把 P(B)、Rmr(c) 这类函数记法当成选项字母
+    if len(s) <= 8:
+        m = re.search(r'[（(]\s*([A-Ha-h])\s*[）)]', ascii_fw(s))
+        if m: return m.group(1).upper()
     if re.fullmatch(r'[A-H](?:\s*[、,，]?\s*[A-H])*', s): return s.replace(' ', '')
     if choice:
         # `A（单选·标准答案…）` / `B：直流24伏…` / `A（S136）最贵…` → 取开头连续字母串
@@ -168,7 +307,7 @@ def parse_bank(path: Path, bank: str) -> list[dict]:
                    'stem': stem, 'qtype_mark': tm.group('t') if tm else '',
                    'level': int(lm.group('lv')) if lm else None,
                    'meta': (meta or '').strip(), 'options': [],
-                   'answer': '', 'explanation': '', 'source': '', 'note': ''}
+                   'answer': '', 'explanation': '', 'source': '', 'note': '', 'extra': ''}
             continue
         if cur is None: continue
         s = line.strip()
@@ -187,6 +326,8 @@ def parse_bank(path: Path, bank: str) -> list[dict]:
             cur['options'] += split_options(m.group(1)); continue
         m = re.match(r'^-\s*分类[：:]\s*(.+)$', s)
         if m: cur['cat_line'] = m.group(1).strip(); continue
+        m = re.match(r'^-\s*题干补充[：:]\s*(.+)$', s)   # 选项写在补充行：`- 题干补充：A 材料  B 基本尺寸 …`
+        if m: cur['extra'] = (cur.get('extra', '') + ' ' + m.group(1)).strip(); continue
         if s.startswith('>') or s.startswith('<!--'):
             cur['note'] = (cur['note'] + ' ' + s.lstrip('> ').strip()).strip(); continue
         if cur['answer']:
@@ -194,37 +335,93 @@ def parse_bank(path: Path, bank: str) -> list[dict]:
         else:
             cur['note'] = (cur['note'] + ' ' + s).strip()
     if cur: items.append(cur)
-    KNOWN = ('判断', '单选', '多选', '问答', '填空', '计算', '识记', '简答', '名词解释', '画图', '编程', '选择', '综合')
     for q in items:
-        mark = q['qtype_mark']
-        # 【公司真题】【培训机构套卷】这类是**卷别标记**不是题型 → 不能当 qtype（2026-10-10 踩过）
-        if mark and any(k in mark for k in KNOWN):
+        # ① 选项恢复（多来源、多格式）：内联带标点 → 空格/紧贴分列 → 题干尾部
+        if not q['options']:
+            ia = ''
+            for src in (q['answer'], q.get('note', ''), q['explanation'], q.get('extra', '')):
+                opts, a2 = split_inline_options(src)
+                if opts:
+                    q['options'], ia = opts, (a2 or ia)
+                    break
+            if not q['options']:
+                for src in (q.get('extra', ''), q['explanation'], q['answer'], q.get('note', '')):
+                    opts, a2 = split_loose_options(src)
+                    if opts:
+                        q['options'], ia = opts, (a2 or ia)
+                        break
+            if not q['options']:
+                st, so = split_options_in_stem(q['stem'])
+                if so:
+                    q['stem'], q['options'] = st, so
+            if q['options'] and ia:
+                q['answer'] = ia
+        # ② 答案写的是文字时，按选项文本反查字母（唯一命中才认）
+        if q['options'] and q['answer']:
+            na0 = norm_answer(q['answer'], True)
+            if na0 not in ('对', '错') and not re.fullmatch(r'[A-H]+', na0 or ''):
+                lt = letter_by_option_text(q['answer'], q['options'])
+                if lt:
+                    q['answer'] = lt
+        mark_raw = q['qtype_mark']
+        mark = canon_type(mark_raw)
+        if mark_raw and not mark:
+            q['paper_tag'] = mark_raw      # 【公司真题】【培训机构套卷】是卷别标记，不是题型
+        raw = q['answer']
+        up = (raw or '').strip().upper()
+        letters = re.sub(r'[^A-H]', '', up) if re.fullmatch(r'[A-H](?:\s*[、,，]?\s*[A-H])*', up) else ''
+        has_blank = bool(re.search(r'（\s*　*\s*）|（\s*）|\(\s*\)|＿+|____', q['stem']))
+        # ③ 结构优先：答案形态 > 选项数量 > 源标注（冲突时以结构为准；选项找不回来就不标选择题）
+        if is_tf_options(q['options']) or norm_answer(raw, True) in ('对', '错'):
+            q['qtype'] = '判断'
+        elif len(q['options']) >= 2:
+            if letters:
+                q['qtype'] = '多选' if len(letters) > 1 else '单选'
+            else:
+                q['qtype'] = '多选' if '多选' in mark_raw else '单选'
+        elif mark in ('单选', '多选'):
+            q['qtype'] = '填空' if has_blank else '问答'    # 标注是选择题但选项找不回来 → 不冒充选择题
+            q['opt_missing'] = True
+        elif mark == '判断':
+            if not raw or '待补' in raw:
+                q['qtype'] = '判断'                     # 答案待补：尊重源标注
+            else:
+                q['qtype'] = '填空' if has_blank else '问答'   # 标注判断题但答案不是对/错
+                q['ans_bad'] = True
+        elif mark:
             q['qtype'] = mark
         else:
             q['qtype'] = infer_type(q['stem'], q['options'], q['meta'])
-            q['paper_tag'] = mark
-        # 有选项就一定是选择题，别停在"识记"（先定题型，答案归一依赖它）
-        if q['options'] and q['qtype'] in ('识记', '问答', ''):
-            letters = set(re.findall(r'[A-H]', (q['answer'] or '').upper()))
-            q['qtype'] = '多选' if len(letters) > 1 else '单选'
-        # 答案归一：`**A**（单选·标准答案…）`→A、`**√。减压阀…`→对；原文挪进题解保留
-        raw = q['answer']
-        is_choice = bool(q['options']) or bool(re.search(r'单选|多选|选择|判断|选型', q['qtype'] or ''))
-        q['answer'] = norm_answer(raw, is_choice)
+        # ④ 判断题不该挂一堆非对/错选项（多题粘连的源数据）→ 挪进备注，避免被当选择题渲染
+        if q['qtype'] == '判断' and q['options'] and not is_tf_options(q['options']):
+            q['note'] = ((q['note'] + ' ') if q['note'] else '') + '【原选项:' + ' '.join(q['options']) + '】'
+            q['options'] = []
+        # ⑤ 答案归一（原文挪进题解保留）
+        q['answer'] = norm_answer(raw, q['qtype'] in ('判断', '单选', '多选'))
         if raw and q['answer'] != raw:
-            q['explanation'] = (('原文答案：' + raw + '　') + q['explanation']).strip()
-        # 判断+选项+字母答案 = 被误标的单选/多选（《答案及评分参考》区整段如此），纠正题型
-        if q['options'] and q['qtype'] == '判断' and re.fullmatch(r'[A-H][A-H、,，\s]{0,7}', q['answer'] or ''):
-            q['qtype'] = '多选' if len(set(re.findall(r'[A-H]', q['answer']))) > 1 else '单选'
+            tag = '' if re.match(r'^(?:参考)?答案', raw.strip()) else '原文答案：'   # 别写成「原文答案：答案：…」
+            q['explanation'] = ((tag + raw + '　') + q['explanation']).strip()
+        # ⑥ 复合标注（计算/问答、本周综合题…）留在 meta，便于人工回溯
+        if mark_raw and mark_raw != q['qtype']:
+            q['meta'] = ((q['meta'] + ' ') if q['meta'] else '') + '【原标注:' + mark_raw + '】'
         if q.get('cat_line'):
             q['cat_name'] = q['cat_line']
-        # 答案兜底：正文/备注/题解里内嵌的「答案：X」
+        # ⑦ 答案兜底：正文/备注/题解里内嵌的「答案：X」
         if not q['answer'] or '待补' in q['answer']:
             for blob in (q['stem'], q['meta'], q['note'], q['explanation']):
                 m = re.search(r'答案[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*|对|错|√|×|正确|错误)', blob or '')
                 if m:
                     q['answer'] = m.group(1).strip()
                     break
+        # ⑧ 答案补上后再次校形（待补→字母答案的选择题）
+        if q['answer'] and '待补' not in q['answer']:
+            na = norm_answer(q['answer'], True)
+            if na and na not in ('对', '错'):
+                if re.fullmatch(r'[A-H]+', na) and len(q['options']) >= 2:
+                    q['qtype'] = '多选' if len(na) > 1 else '单选'
+                elif q['qtype'] == '判断':
+                    q['qtype'] = '填空' if has_blank else '问答'
+                    q['ans_bad'] = True
     return items
 
 def parse_cards(path: Path) -> list[dict]:
@@ -279,6 +476,14 @@ def main() -> int:
     if dup: problems.append('主库重复题号：%s' % dup[:10])
     no_ans = [q['id'] for q in qs if not q['answer'] or '待补' in q['answer']]
     no_lv = [q['id'] for q in qs if not q['level']]
+    opt_missing = [q['id'] for q in qs + learn if q.get('opt_missing')]
+    ans_bad = [q['id'] for q in qs + learn if q.get('ans_bad')]
+    if opt_missing:
+        problems.append('标注为选择题但选项找不回来（已按填空/问答归类，建议人工补选项）：%s'
+                        % ', '.join(opt_missing[:15]) + (' …' if len(opt_missing) > 15 else ''))
+    if ans_bad:
+        problems.append('标注为判断题但答案不是对/错（已按填空/问答归类）：%s'
+                        % ', '.join(ans_bad[:15]) + (' …' if len(ans_bad) > 15 else ''))
     stale = sum(1 for q in qs if q['index_ans_flag'] is False and q['answer'] and '待补' not in q['answer'])
     if stale: problems.append(f'分类索引 ans=false 但正文有答案：{stale} 条（索引过时）')
     # SQLite
@@ -356,6 +561,7 @@ def main() -> int:
               f'- 重复题号：**{len(dup)}** ✓' if not dup else f'- 重复题号：{dup}',
               f'- 难度分布：{dict(sorted(Counter(q["level"] for q in allq if q["level"]).items()))}',
               f'- 题型分布：{dict(Counter(q["qtype"] for q in allq).most_common(8))}',
+              f'- 选项恢复/题型校正：选择题缺选项 **{len(opt_missing)}** 条 ｜ 判断题答案非对错 **{len(ans_bad)}** 条',
               f'- 带题解：{sum(1 for q in allq if q["explanation"])} 条 ｜ 带来源：{sum(1 for q in allq if q["source"])} 条']
     if problems: lines += ['', '## 需人工复核', ''] + [f'- {p}' for p in problems]
     (ROOT / 'BUILD_REPORT.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
