@@ -890,11 +890,15 @@ $('#c-kw').onkeydown = e => { if (e.key === 'Enter') searchCards(); };
 async function refreshImportUI(){
   const note = $('#imp-mode-note'), body = $('#imp-body');
   if (!STATIC) {
+    // 服务端没有 /api/custom、/api/template、/api/import_questions —— 别发请求，否则进度页每次都弹 404
     note.textContent = '（仅 APK 离线模式支持；电脑版请把题加进 sqlite 源库后重建）';
     body.classList.add('imp-off');
-  } else {
-    note.textContent = '（导入的题存在本机，随 APK 一起走）';
+    $('#imp-count').textContent = '在线模式：题库来自 sqlite';
+    $('#imp-clear').disabled = true;
+    return;
   }
+  note.textContent = '（导入的题存在本机，随 APK 一起走）';
+  body.classList.remove('imp-off');
   const r = await api('/api/custom');
   const n = (r && r.items) ? r.items.length : 0;
   $('#imp-count').textContent = n ? `自定义题 ${n} 道` : '暂无自定义题';

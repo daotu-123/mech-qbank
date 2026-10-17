@@ -280,6 +280,12 @@ def http_smoke(m, tmp: Path, public: bool):
     print('\n== HTTP 层：%s 模式 ==' % ('公开子集' if public else '全量库（临时副本）'))
     st = fresh_store(m, tmp, public, tag='-http')   # 与 store 层用不同文件，避免互相污染
     m.STORE = st
+    # 契约检查：前端在在线模式会调的接口，服务端必须有（曾因 /api/custom 缺失导致进度页弹 404）
+    html = (ROOT / 'web' / 'index.html').read_text(encoding='utf-8')
+    srv = set(re.findall(r"'/api/([a-z_]+)'", (ROOT / 'app' / 'server.py').read_text(encoding='utf-8')))
+    static_only = {'custom', 'template', 'import_questions'}   # 仅 APK 静态模式（前端已按模式跳过）
+    used = set(re.findall(r"api\('/api/([a-z_]+)", html)) - static_only
+    check('前后端接口契约：前端调用的接口服务端都有', used <= srv, str(sorted(used - srv)))
     srv = m.ThreadingHTTPServer(('127.0.0.1', 0), m.H)
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
