@@ -9,6 +9,10 @@
 |---|---|---|---|
 | ![选择题](docs/quiz-choice.png) | ![判断题](docs/quiz-judge.png) | ![打卡](docs/checkin.png) | ![备注](docs/notes.png) |
 
+**PDF 摘录 → 挖空 / 判断题 → 一键入库**（划词即挖空，答案自动收集，填空逐空自动判分）：
+
+![PDF 摘录编辑器](docs/excerpt-editor.png)
+
 - **前后端分离**：前端 Vue 3 + Element Plus（`web/`，Vite 构建），后端 FastAPI（`app/api.py`，RESTful API）；另保留零依赖的标准库版 `app/server.py` 供无 pip 环境使用，两边共用 `app/core.py` 数据层（判分与排期行为由 `tools/smoke_parity.py` 差分守护）
 - **一套 UI 两个壳**：Windows 双击 `start.bat` 即用（在线模式）；同一份 `web/dist` 也能塞进 Android WebView 壳出 APK（file:// 静态模式：数据内联成 `qbank-data.js`，进度存 localStorage，飞行模式可用）
 - **不做 LLM 批改**：选择题/判断题本地自动判分，问答类给出参考答案由你自评（无 key、无联网、无隐私外泄）
