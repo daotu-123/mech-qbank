@@ -68,6 +68,7 @@ cd web && npm install && npm run build && cd ..
 - **代码**：MIT（见 `LICENSE`）
 - **内容**（题库文本、知识点卡片）：CC-BY-SA-4.0（见 `LICENSE-CONTENT`）
 - 本仓库**只收录作者自出的题目与通用机械知识点**。任何**公司真题、培训机构套卷、第三方网站面经**均不在收录范围内，构建脚本会按来源分级自动拦截（见 `tools/qbank_build.py` 的 `classify()` 与 `clean()`）。
+- 公开题库的选择题来自 `data/selfauthored/questions.json`（**原创自研题**，190 道），由作者依据自编知识点卡片改写，题目与选项均为原创。它随仓库提交、可直接参与组卷与复习，也是公开版唯一的选择题来源。
 
 ## 目录结构
 
@@ -92,6 +93,7 @@ mech-qbank/
 ├ tools/answer_fix.tsv    人工核定过的答案覆盖表（题号+字母+依据），构建时重放，重建不丢
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
+│ ├ selfauthored/        原创自研题（手工维护的单一真相源，入库，公开版选择题来源）
 │ └ public/qbank.json    公开子集（示例数据，入库）
 ├ docs/                   界面截图（README 展示用）
 ├ build_exe.bat           PyInstaller 打包（api.py + web/dist，纯 ASCII）
@@ -154,7 +156,7 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
 
 产物 `dist\mech-qbank.exe`（约 18 MB，实测）：
 
-- **双击即用**：自带公开题库（76 题 + 387 知识点卡），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
+- **双击即用**：自带公开题库（266 题 + 387 知识点卡，其中 190 道为可自动判分的原创选择题），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
 - **无终端窗口**：`--windowed` 打包，双击后只有浏览器界面；日志写 exe 同级 `qbank.log`（启动信息、异常堆栈），排查问题先看它
 - **怎么退出**：点页面右下角「退出程序」按钮（调 `POST /api/v1/system/shutdown`，同样只放行本机 Host）；没有终端可按 Ctrl+C
 - **想用你自己的全量库**：把 `qbank.sqlite` 放进 exe 同级的 `data\` 目录即可，程序自动切换成全量模式（实测：2330 题）
