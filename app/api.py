@@ -28,7 +28,8 @@ import webbrowser
 from urllib.parse import urlparse
 
 import core
-from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log, _log_exc)
+from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log, _log_exc,
+                  clamp_int)
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +82,24 @@ class NoteIn(BaseModel):
 
 class ImportIn(BaseModel):
     progress: dict = Field(default_factory=dict)
+
+
+class CustomIn(BaseModel):
+    questions: list = Field(default_factory=list)
+    mode: str = 'skip'          # skip=撞已导入 id 跳过；cover=覆盖更新
+
+
+class CustomQIn(BaseModel):
+    id: str
+    stem: str
+    qtype: str = ''
+    level: Optional[int] = None
+    options: list = Field(default_factory=list)
+    answer: str = ''
+    explanation: str = ''
+    bank: str = ''
+    section_path: str = ''
+    cat_name: str = ''
 
 
 # ---------------------------------------------------------------- 题库
@@ -145,6 +164,35 @@ def delete_note(qid: str):
 @app.get('/api/v1/notes')
 def notes(limit: int = 500):
     return {'items': STORE.notes_list(limit)}
+
+
+# ---------------------------------------------------------------- 自定义题（PDF 摘录编辑器）
+@app.post('/api/v1/import_questions')
+def import_questions(body: CustomIn):
+    """批量导入自定义题（编辑器保存 / JSON 粘贴）。mode: skip | cover。"""
+    r = STORE.import_customs(body.questions, cover=body.mode == 'cover')
+    return {'ok': True, 'added': r['added'], 'skipped': r['skipped'], 'rejected': r['rejected']}
+
+
+@app.post('/api/v1/custom')
+def create_custom(body: CustomQIn):
+    r = STORE.add_custom(body.model_dump(), cover=True)
+    if 'err' in r:
+        raise HTTPException(400, r['err'])
+    return r
+
+
+@app.get('/api/v1/custom')
+def custom_list(limit: int = 500):
+    return {'items': STORE.custom_list(clamp_int(limit, 500, 1, 5000))}
+
+
+@app.delete('/api/v1/custom/{qid}')
+def delete_custom(qid: str):
+    r = STORE.delete_custom(qid)
+    if r.get('error'):
+        raise _404()
+    return r
 
 
 # ---------------------------------------------------------------- 进度

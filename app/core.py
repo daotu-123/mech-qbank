@@ -129,12 +129,43 @@ def like_escape(s: str) -> str:
     return (s or '').replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
+# 全角字母数字 → 半角（填空判分归一化用；与 static-store.js 的 normFill 同规则）
+_F2H = {ord(f): ord(t) for f, t in zip(
+    '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ',
+    '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz')}
+
+
+def _norm_fill(s: str) -> str:
+    """填空判分归一化：全角转半角、去首尾空白与尾部标点、小写。
+    与 web/src/store/static-store.js 的 normFill 同规则（parity 差分兜底）。"""
+    s = (s or '').strip().translate(_F2H)
+    return s.rstrip('。.，,；;：:！!？?').lower()
+
+
 def norm_judge(s):
     """把 对/正确/√/T/1 之类归一成 '对'，错/×/F/0 归一成 '错'，其余返回 None。"""
     s = (s or '').strip().lower().rstrip('。.')
     if s in TRUE_SET: return '对'
     if s in FALSE_SET: return '错'
     return None
+
+
+def fill_slots(qtype: str, answer: str) -> int:
+    """可判分填空的空数；0 = 不按填空判分（走自评）。
+    与 static-store.js 的 fillSlots / QuestionCard 的 isFill 同规则（parity 差分兜底）：
+      · answer 含 | → 多空
+      · qtype 恰为「填空」且答案短（≤20 字、无①式圈号与分号）→ 单空
+      · 老数据（①②③式长答案、'填空/问答' 混合题型、待补）→ 0
+    """
+    qt = (qtype or '').strip()
+    ans = (answer or '').strip()
+    if '填空' not in qt or not ans or '待补' in ans:
+        return 0
+    if '|' in ans:
+        return len(ans.split('|'))
+    if qt == '填空' and len(ans) <= 20 and not re.search(r'[①②③④⑤⑥；;]', ans):
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------- 数据层
@@ -298,9 +329,12 @@ class Store:
 
     def _pub_row(self, r) -> dict:
         sp = (r['section_path'] or '') if r.keys() and 'section_path' in r.keys() else ''
+        ans = (r['answer'] or '') if r.keys() and 'answer' in r.keys() else ''
         return {'id': r['id'], 'stem': r['stem'], 'qtype': r['qtype'], 'level': r['level'],
                 'options': json.loads(r['options'] or '[]'), 'cat': r['cat_name'], 'bank': r['bank'],
-                'source_class': r['source_class'], 'sec': sp.split(' › ')[0] if sp else ''}
+                'source_class': r['source_class'], 'sec': sp.split(' › ')[0] if sp else '',
+                # 只暴露空数、不暴露答案：前端据此渲染 N 个输入框（防答案泄露前提下的 UI 决策）
+                'fill_n': fill_slots(r['qtype'], ans)}
 
     def full(self, qid: str):
         rows = self.q('SELECT * FROM questions WHERE id=?', (qid,))
@@ -392,6 +426,21 @@ class Store:
             opts = json.loads(row['options'] or '[]')
         except Exception:
             opts = []
+        # 0) 填空题（PDF 摘录挖空题）：空数与判分口径见 fill_slots()，必须最优先——
+        #    单空答案恰为「对/错」时会落进下面的判断题分支被误判。
+        if fill_slots(qt, ans):
+            fill_parts = ([p.strip() for p in ans.split('|')] if '|' in ans else [ans.strip()])
+            # 全角竖线 ｜ 是中文输入法下的常见笔误，与半角同义
+            gparts = [p.strip() for p in (given or '').replace('｜', '|').split('|')]
+            if len(gparts) < len(fill_parts):          # 少填的空按空串判错，不报错
+                gparts += [''] * (len(fill_parts) - len(gparts))
+            detail, ok = [], True
+            for i, a in enumerate(fill_parts):
+                na = _norm_fill(a)
+                hit = bool(na) and _norm_fill(gparts[i]) == na
+                detail.append({'i': i + 1, 'ans': a, 'given': gparts[i], 'ok': hit})
+                ok = ok and hit
+            return {'answer': ans, 'explanation': row['explanation'], 'correct': ok, 'fill': detail}
         # 1) 判断题：答案是对/错，且（无选项 或 题型标注判断）
         j = norm_judge(ans)
         if j and (not opts or '判断' in qt):
@@ -598,6 +647,105 @@ class Store:
             notes[qid] = {'note': note, 'updated_at': now}
             self._save_notes()
             return {'ok': True, 'id': qid, 'note': note, 'updated_at': now, 'removed': False}
+
+    # ---- 自定义题（PDF 摘录编辑器保存的用户题；qbank_build.py 重建时按 source_class 保留）----
+    # 与 static-store.js 的 normCustomQ/mergeQuestions 同规则（parity/冒烟兜底）。
+    QTYPES = ('判断', '单选', '多选', '填空', '问答', '计算', '识记', '综合')
+    CUSTOM_BANK = 'PDF 自建'
+    CUSTOM_CLASS = '自定义'
+
+    def _norm_custom_q(self, raw: dict) -> dict:
+        if not isinstance(raw, dict):
+            return {'err': '不是合法题目对象'}
+        qid = str(raw.get('id') or '').strip()
+        stem = str(raw.get('stem') or '').strip()
+        if not qid:
+            return {'err': '缺少 id（题号）'}
+        if not stem:
+            return {'err': '缺少题干（stem）：' + qid}
+        # 撞号检查：只挡「淬取题/内置题」撞号；自定义题同 id 视为更新（由 add_custom 的 cover 把关）
+        if self.custom_row(qid) is None and self.full(qid):
+            return {'err': 'id 与已有题目重复，换一个 id：' + qid}
+        qt = str(raw.get('qtype') or '').strip()
+        if qt and qt not in self.QTYPES:
+            return {'err': '题型不在 8 种之内：' + qt}
+        lv = raw.get('level')
+        try:
+            lv = None if lv in (None, '') else max(1, min(5, int(str(lv).strip())))
+        except (TypeError, ValueError):
+            lv = None
+        opts = raw.get('options') or []
+        if not isinstance(opts, list):
+            return {'err': 'options 必须是数组：' + qid}
+        return {'ok': True, 'q': {
+            'id': qid, 'stem': stem,
+            'qtype': qt or '问答', 'level': lv,
+            'options': [str(o) for o in opts],
+            'answer': str(raw.get('answer') or ''),
+            'explanation': str(raw.get('explanation') or ''),
+            'bank': str(raw.get('bank') or '').strip() or self.CUSTOM_BANK,
+            'section_path': str(raw.get('section_path') or '').strip(),
+            'cat_name': str(raw.get('cat_name') or '').strip(),
+            'source_class': self.CUSTOM_CLASS}}
+
+    def add_custom(self, raw: dict, cover: bool = False) -> dict:
+        """写入/更新一道自定义题。返回 {ok, id} 或 {err}。"""
+        r = self._norm_custom_q(raw)
+        if 'err' in r:
+            return {'err': r['err']}
+        q = r['q']
+        with self.lock:
+            if not cover and self.custom_row(q['id']):
+                return {'err': '已存在同 id 自定义题（cover=false 不覆盖）：' + q['id']}
+            self.x('INSERT OR REPLACE INTO questions(id,bank,source_class,section_path,section,'
+                   'cat_name,stem,qtype,level,options,answer,explanation,source,note,meta)'
+                   ' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (q['id'], q['bank'], self.CUSTOM_CLASS, q['section_path'], '', q['cat_name'],
+                    q['stem'], q['qtype'], q['level'], json.dumps(q['options'], ensure_ascii=False),
+                    q['answer'], q['explanation'], '', '', ''))
+            self._banks = None            # 缓存失效：bank 列表要能看到「PDF 自建」
+            self._sections = None
+            return {'ok': True, 'id': q['id']}
+
+    def custom_row(self, qid: str):
+        with self.lock:
+            return self.con.execute(
+                'SELECT id,stem,qtype,level,options,answer,explanation,bank,section_path,cat_name'
+                ' FROM questions WHERE id=? AND source_class=?', (qid, self.CUSTOM_CLASS)).fetchone()
+
+    def custom_list(self, limit: int = 500) -> list:
+        # 不返回 answer：列表只用于管理（题号/题型/题干），与 static-store 的 customList 同口径
+        with self.lock:
+            rows = self.con.execute(
+                'SELECT id,stem,qtype,level,bank FROM questions WHERE source_class=?'
+                ' ORDER BY id', (self.CUSTOM_CLASS,)).fetchall()
+        return [dict(r) for r in rows[:limit]]
+
+    def delete_custom(self, qid: str) -> dict:
+        qid = (qid or '').strip()
+        if not self.custom_row(qid):
+            return {'error': 'not found'}
+        with self.lock:
+            self.x('DELETE FROM questions WHERE id=? AND source_class=?', (qid, self.CUSTOM_CLASS))
+            # 级联清进度：留着会让 stats 的已答/掌握/错题统计把一道不存在的题算进去
+            self.x('DELETE FROM progress WHERE id=?', (qid,))
+        return {'ok': True, 'id': qid, 'removed': True}
+
+    def import_customs(self, questions, cover: bool = False) -> dict:
+        """批量导入自定义题（编辑器保存 / JSON 粘贴）。返回 {added,skipped,rejected}。"""
+        if not isinstance(questions, list):
+            return {'added': 0, 'skipped': 0, 'rejected': [{'id': '（无 id）', 'err': 'questions 必须是数组'}]}
+        added = skipped = 0
+        rejected = []
+        for raw in questions:
+            r = self.add_custom(raw, cover=cover)
+            if r.get('ok'):
+                added += 1
+            elif '已存在同 id' in (r.get('err') or ''):
+                skipped += 1
+            else:
+                rejected.append({'id': str((raw or {}).get('id') or '（无 id）'), 'err': r['err']})
+        return {'added': added, 'skipped': skipped, 'rejected': rejected}
 
 
 STORE: Store | None = None

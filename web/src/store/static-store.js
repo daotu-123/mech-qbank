@@ -48,6 +48,21 @@ function normJudge(s) {
   if (FALSE_SET[s]) return '错';
   return null;
 }
+// 填空判分归一化：全角转半角、去首尾空白与尾部标点、小写（与 core.py 的 _norm_fill 同规则）
+function normFill(s) {
+  s = String(s == null ? '' : s).trim();
+  s = s.replace(/[０-９Ａ-Ｚａ-ｚ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  s = s.replace(/[。.，,；;：:！!？?]+$/, '');
+  return s.toLowerCase();
+}
+// 可判分填空的空数；0 = 走自评（与 core.py 的 fill_slots 同规则）
+function fillSlots(q) {
+  const qt = String(q.qtype || '').trim();
+  const ans = String(q.answer || '').trim();
+  if (qt.indexOf('填空') < 0 || !ans || ans.indexOf('待补') >= 0) return 0;
+  if (ans.indexOf('|') >= 0) return ans.split('|').length;
+  return (qt === '填空' && ans.length <= 20 && !/[①②③④⑤⑥；;]/.test(ans)) ? 1 : 0;
+}
 function sec0(sp) { return String(sp || '').split(' › ')[0].trim(); }   // core.py：section_path 第一段
 function monthStr(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1); }
 function dayKey(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
@@ -144,6 +159,21 @@ export function make(DATA, storage) {
     return custom.map((q) => ({ id: q.id, qtype: q.qtype, level: q.level, stem: q.stem, bank: q.bank }));
   }
 
+  function removeCustom(qid) {
+    qid = String(qid == null ? '' : qid).trim();
+    const n = custom.length;
+    custom = custom.filter((q) => q.id !== qid);
+    const removed = custom.length < n;
+    if (removed) {
+      questions = builtin.concat(custom);
+      reindex();
+      saveCustom();
+      // 级联清进度：留着会让 stats 把一道不存在的题算进已答/掌握/错题（与 core.py delete_custom 同口径）
+      if (prog[qid]) { delete prog[qid]; saveProg(); }
+    }
+    return removed;
+  }
+
   function clearCustom() {
     const n = custom.length;
     custom = [];
@@ -186,7 +216,8 @@ export function make(DATA, storage) {
   function pubRow(q) {
     return { id: q.id, stem: q.stem, qtype: q.qtype, level: q.level,
              options: q.options || [], cat: q.cat_name, bank: q.bank,
-             source_class: q.source_class, sec: sec0(q.section_path) };
+             source_class: q.source_class, sec: sec0(q.section_path),
+             fill_n: fillSlots(q) };   // 只暴露空数、不暴露答案（与 core.py _pub_row 同口径）
   }
 
   // ---- 判分（与 core.py Store.grade 同源）----
@@ -200,6 +231,22 @@ export function make(DATA, storage) {
     const ans = ansRaw.replace(/\*\*/g, '').trim();     // 兜底剥离历史数据的加粗标记
     const qt = q.qtype || '';
     const opts = q.options || [];
+    // 0) 填空题（PDF 摘录挖空题）：空数与判分口径见 fillSlots()，必须最优先——
+    //    单空答案恰为「对/错」时会被判断题分支误判（与 core.py 同序）。
+    if (fillSlots(q)) {
+      const fillParts = ans.indexOf('|') >= 0 ? ans.split('|').map((x) => x.trim()) : [ans.trim()];
+      const gparts = String(given == null ? '' : given).replace(/｜/g, '|').split('|').map((x) => x.trim());
+      while (gparts.length < fillParts.length) gparts.push('');
+      const detail = [];
+      let ok = true;
+      for (let i = 0; i < fillParts.length; i++) {
+        const na = normFill(fillParts[i]);
+        const hit = !!na && normFill(gparts[i]) === na;
+        detail.push({ i: i + 1, ans: fillParts[i], given: gparts[i], ok: hit });
+        ok = ok && hit;
+      }
+      return { answer: ans, explanation: q.explanation, correct: ok, fill: detail };
+    }
     // 1) 判断题：答案是对/错，且（无选项 或 题型标注判断）
     const j = normJudge(ans);
     if (j && (!opts.length || qt.indexOf('判断') >= 0)) {
@@ -557,6 +604,7 @@ export function make(DATA, storage) {
            cards: cards, chapters: chapters, wrong_list: wrongList, stats: stats,
            export_progress: exportProgress, import_progress: importProgress,
            merge_questions: mergeQuestions, custom_list: customList, clear_custom: clearCustom,
+           remove_custom: removeCustom,
            export_template: exportTemplate,
            checkin: checkin, manual_checkin: manualCheckin,
            export_checkin: exportCheckin, import_checkin: importCheckin,

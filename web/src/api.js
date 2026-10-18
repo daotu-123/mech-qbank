@@ -14,6 +14,9 @@
  *   GET    /progress               导出进度
  *   POST   /progress               导入进度
  *   PUT    /progress/{id}          记录结果（mark）
+ *   POST   /import_questions       批量导入自定义题（PDF 摘录编辑器保存）
+ *   GET    /custom                 自定义题列表
+ *   DELETE /custom/{id}            删除一道自定义题
  *   GET    /wrong /stats /banks /sections /chapters /cards
  *   GET    /checkins?month=        打卡日历
  *   POST   /checkins               手动补签
@@ -90,6 +93,12 @@ function staticRoute(path, body, method) {
     return { ok: true, added: r.added, updated: r.updated, skipped: r.skipped, rejected: r.rejected };
   }
   if (p === '/custom') return { items: S.custom_list() };
+  const md = /^\/custom\/([^/]+)$/.exec(p);
+  if (md) {
+    if (method === 'DELETE') return S.remove_custom(decodeURIComponent(md[1]))
+      ? { ok: true, removed: true } : { error: 'not found' };
+    return { error: 'not found' };
+  }
   return { error: 'not found' };
 }
 

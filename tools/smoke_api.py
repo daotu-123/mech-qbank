@@ -120,7 +120,7 @@ def api_smoke(m, public: bool):
     api_src = (ROOT / 'app' / 'api.py').read_text(encoding='utf-8')
     routes = set(re.findall(r"@app\.(?:get|post|put|delete)\('/api/v1([^']*)'", api_src))
     js_src = (ROOT / 'web' / 'src' / 'api.js').read_text(encoding='utf-8')
-    static_only = {'/template', '/import_questions', '/custom'}   # 仅 APK 静态模式（前端按模式分流）
+    static_only = {'/template'}   # 仅 APK 静态模式；/import_questions 与 /custom 两端都已实现
     used = set(re.findall(r"p === '(/[a-z_]+)'", js_src))
     used = {u for u in used if u not in static_only}
     check('前后端接口契约：静态路由在服务端都有注册', used <= routes, str(sorted(used - routes)))
@@ -202,6 +202,60 @@ def api_smoke(m, public: bool):
 
         code, d, _ = jget('/wrong')
         check('GET /wrong（刚答错过 TS1）', code == 200 and any(x['id'] == 'TS1' for x in d.get('items', [])), d)
+
+        # ---- 自定义题（PDF 摘录编辑器）：导入 / 填空判分 / 列表 / 删除 ----
+        customs = [
+            {'id': 'XC1', 'stem': '齿轮的（　）圆是分度基准，大小由（　）决定', 'qtype': '填空',
+             'answer': '分度圆|模数', 'level': 1, 'bank': 'PDF 自建', 'explanation': '模数决定齿形大小'},
+            {'id': 'XJ1', 'stem': '平键能传递轴向力', 'qtype': '判断', 'answer': '错',
+             'level': 1, 'bank': 'PDF 自建', 'explanation': '平键只固定周向'},
+        ]
+        code, d, _ = req('POST', '/import_questions', {'questions': customs, 'mode': 'skip'})
+        check('POST /import_questions 批量导入自定义题',
+              code == 200 and d.get('added') == 2 and not d.get('rejected'), d)
+        code, d, _ = req('POST', '/import_questions', {'questions': customs, 'mode': 'skip'})
+        check('POST /import_questions 重复导入 → skipped',
+              code == 200 and d.get('skipped') == 2 and d.get('added') == 0, d)
+        code, d, _ = req('POST', '/import_questions', {'questions': [{'id': 'TS1', 'stem': '撞号'}]})
+        check('POST /import_questions 撞淬取题号 → rejected',
+              code == 200 and len(d.get('rejected') or []) == 1, d)
+
+        code, d, _ = req('POST', '/questions/XC1/grade', {'given': '分度圆|模数'})
+        check('填空判分：两空全对 → correct + fill 明细',
+              code == 200 and d.get('correct') is True and len(d.get('fill') or []) == 2, d)
+        code, d, _ = req('POST', '/questions/XC1/grade', {'given': '分度圆|压力角'})
+        check('填空判分：错一空 → correct=False 且逐空标对错',
+              code == 200 and d.get('correct') is False
+              and [x['ok'] for x in d.get('fill') or []] == [True, False], d)
+        code, d, _ = req('POST', '/questions/XC1/grade', {'given': '分度圆'})
+        check('填空判分：空数不齐按空串判错', code == 200 and d.get('correct') is False, d)
+        code, d, _ = req('POST', '/questions/XC1/grade', {'given': ' 分度圆 ｜ 模数。'})
+        check('填空判分：全角竖线与首尾空白/句号被归一',
+              code == 200 and d.get('correct') is True, d)
+        code, d, _ = req('POST', '/questions/XJ1/grade', {'given': '错'})
+        check('判断判分：自定义判断题', code == 200 and d.get('correct') is True, d)
+
+        code, d, _ = jget('/custom')
+        check('GET /custom 列表', code == 200 and len(d.get('items') or []) == 2, d)
+        code, d, _ = jget('/questions?q=' + urllib.parse.quote('分度基准'))
+        check('自定义题可被搜索', code == 200 and any(x['id'] == 'XC1' for x in d.get('items', [])), d)
+        code, d, _ = req('PUT', '/progress/XC1', {'result': 'correct'})
+        check('自定义题可记进度', code == 200 and d.get('ok') is True, d)
+        code, d, _ = req('POST', '/custom', {'id': 'XC2', 'stem': '单题接口', 'qtype': '判断', 'answer': '对'})
+        check('POST /custom 单题创建', code == 200 and d.get('ok') is True, d)
+        code, d, _ = req('POST', '/custom', {'id': 'TS1', 'stem': '撞号', 'qtype': '判断', 'answer': '对'})
+        check('POST /custom 撞淬取题号 → 400', code == 400, code)
+        code, d, _ = req('DELETE', '/custom/XC2')
+        check('DELETE /custom/{id}', code == 200 and d.get('removed') is True, d)
+        code, d, _ = req('DELETE', '/custom/XC2')
+        check('DELETE /custom/{id} 再删 → 404', code == 404, code)
+        code, d, _ = req('DELETE', '/custom/XC1')
+        code2, d2, _ = jget('/progress')
+        check('DELETE 自定义题时级联清进度（stats 不虚高）',
+              code == 200 and d.get('removed') is True
+              and 'XC1' not in (d2.get('progress') or {}), list((d2.get('progress') or {}).keys())[:5])
+        code, d, _ = jget('/banks')
+        check('GET /banks 含「PDF 自建」', code == 200 and any('PDF' in str(x) for x in d.get('items', [])), d)
 
         for p in ['/banks', '/sections', '/chapters']:
             code, d, _ = jget(p)

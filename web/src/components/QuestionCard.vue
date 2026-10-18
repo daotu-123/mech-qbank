@@ -33,6 +33,14 @@
         </button>
       </template>
     </template>
+    <template v-else-if="isFill">
+      <div class="meta" style="margin:-6px 0 8px">填空题：每空都要填，提交后逐空判对错（多空可用 | 分隔一次粘贴）</div>
+      <div v-for="(t, k) in fillTexts" :key="k" class="row" style="align-items:center;margin-bottom:8px">
+        <span class="meta" style="width:52px">第 {{ k + 1 }} 空</span>
+        <el-input v-model="fillTexts[k]" :placeholder="'第 ' + (k + 1) + ' 空'" size="default"
+                  style="flex:1" :disabled="!!shown" @keyup.enter="submit" />
+      </div>
+    </template>
     <textarea v-else v-model="freeText" placeholder="先自己答，再点提交看参考答案（自评）"></textarea>
 
     <div class="row" style="margin-top:10px">
@@ -43,6 +51,12 @@
 
     <div v-if="fb" class="fb" :class="fb.cls">
       <div>{{ fb.head }}</div>
+      <div v-if="fb.fill" class="meta" style="margin-top:4px">
+        <div v-for="d in fb.fill" :key="d.i" :style="{ color: d.ok ? 'var(--ok, #3B6D11)' : 'var(--bad, #A32D2D)' }">
+          第 {{ d.i }} 空：<template v-if="d.given">你填「{{ d.given }}」</template><template v-else>（未填）</template>
+          {{ d.ok ? '✓' : '✗ 应为「' + d.ans + '」' }}
+        </div>
+      </div>
       <div v-if="fb.expl">题解：{{ fb.expl }}</div>
       <div v-if="fb.self && !fb.selfDone" class="row" style="margin-top:6px">
         <button class="ghost" @click="selfEval('correct')">我答对了</button>
@@ -56,13 +70,14 @@
     <div class="meta" style="margin-top:10px">
       <template v-if="isJudge">快捷键：<span class="kbd">1</span> 对 · <span class="kbd">2</span> 错 · <span class="kbd">T</span>/<span class="kbd">F</span> 也可 · <span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题</template>
       <template v-else-if="isChoice">快捷键：<span class="kbd">A</span>–<span class="kbd">H</span> 或 <span class="kbd">1</span>–<span class="kbd">8</span> 选择 · <span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题</template>
+      <template v-else-if="isFill">快捷键：<span class="kbd">Tab</span> 切换空位 · <span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题</template>
       <template v-else>快捷键：<span class="kbd">Enter</span> 提交/下一题 · <span class="kbd">→</span> 下一题</template>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus';
 import { api } from '@/api';
 import { session } from '@/store/session';
@@ -82,6 +97,15 @@ const lv = computed(() => lvMeta(props.q.level));
 const lvKey = computed(() => props.q.level == null ? '' : String(props.q.level));
 const isJudge = computed(() => /判断/.test(props.q.qtype || '') && !(props.q.options || []).length);
 const isMulti = computed(() => /多选/.test(props.q.qtype || ''));
+/* 可判分填空（口径见 core.py fill_slots）：fill_n 由服务端/静态 Store 算好下发，
+   只含空数不含答案。>0 渲染 N 个输入框，=0 走自评 textarea。 */
+const isFill = computed(() => (props.q.fill_n || 0) > 0);
+const fillCount = computed(() => props.q.fill_n || 0);
+const fillTexts = ref([]);
+watch(() => [props.q.id, fillCount.value], () => {
+  const prev = (session.given[props.q.id] || '').split('|');
+  fillTexts.value = Array.from({ length: fillCount.value }, (_, k) => prev[k] != null ? prev[k] : '');
+}, { immediate: true });
 const effOpts = computed(() => (props.q.options || []).length ? props.q.options : (isJudge.value ? ['对', '错'] : []));
 const isChoice = computed(() => effOpts.value.length > 0);
 const given = computed(() => session.given[props.q.id] || '');
@@ -141,7 +165,14 @@ function chooseByLetter(letter) {
 async function submit() {
   const q = props.q;
   if (session.shown[q.id]) { emit('next'); return; }          // 已提交过：再按=下一题
-  const givenRaw = isChoice.value ? (session.given[q.id] || '') : (freeText.value || '');
+  let givenRaw;
+  if (isFill.value) {
+    session.given[q.id] = fillTexts.value.map((t) => t.trim()).join('|');   // 多空按 | 拼接传给判分
+    givenRaw = session.given[q.id];
+    if (!fillTexts.value.some((t) => t.trim())) { ElMessage.warning('每空都要填'); return; }
+  } else {
+    givenRaw = isChoice.value ? (session.given[q.id] || '') : (freeText.value || '');
+  }
   if (!givenRaw.trim()) { ElMessage.warning('先作答再提交'); return; }
   const r = await api('/questions/' + encodeURIComponent(q.id) + '/grade', { given: givenRaw });
   if (!r) return;
@@ -151,7 +182,7 @@ async function submit() {
     session.fb[q.id] = { cls: 'info', head: '参考答案：' + (r.answer || ''), expl: r.explanation || '', self: true };
   } else {
     r.correct ? session.res.ok++ : session.res.bad++;
-    session.fb[q.id] = { cls: r.correct ? 'ok' : 'bad', self: false,
+    session.fb[q.id] = { cls: r.correct ? 'ok' : 'bad', self: false, fill: r.fill || null,
       head: (r.correct ? '✓ 答对了' : '✗ 答错了') + '　正确答案：' + (r.answer || ''),
       expl: r.explanation || '' };
     const m = await api('/progress/' + encodeURIComponent(q.id), { result: r.correct ? 'correct' : 'wrong' }, 'PUT');

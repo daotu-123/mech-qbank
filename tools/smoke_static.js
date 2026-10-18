@@ -60,6 +60,9 @@ function synthetic() {
     q('TB2', '另一个题库的题', '问答', 'y', null, 2, '测试库B'),
     q('TU1', '别的来源的题', '问答', 'z', null, 2, '测试库', 'U. 别的 › U1'),
     q('TE1', 'Python print 函数的 sep 参数作用', '填空/问答', '指定输出分隔符'),
+    q('TF1', '齿轮的（　）圆是分度基准，大小由（　）决定', '填空', '分度圆|模数'),
+    q('TF2', '三空答案字面含对错', '填空', '对|错|对'),
+    q('TF3', '老填空①②③式长答案（仍是自评）', '填空', '① 顶线和底线各 1.5 磅；② 表头下栏目线 0.75 磅'),
     q('TP1', '机械效率 100% 可能吗', '问答', '不可能'),
   ], cards: [
     { chapter: 'T. 机械制造', topic: '夹具', name: 'V形块', body: '定位外圆表面', qids: ['TS1'], source_class: '通用知识点' },
@@ -100,6 +103,19 @@ function synthetic() {
   ok(tw.answer === '数控装置、伺服系统、机床本体', '问答：返回参考答案', tw.answer);
   const tn = S.grade('TN1', 'whatever');
   ok(tn.self === true && tn.answer === '待补', '待补答案：自评且回原文', tn.answer);
+  // ---- 填空自动判分（PDF 摘录挖空题：answer 用 | 分隔各空）----
+  const f1 = S.grade('TF1', '分度圆|模数');
+  ok(f1.correct === true && f1.fill.length === 2 && f1.fill.every(x => x.ok), '填空：两空全对', f1);
+  const f2 = S.grade('TF1', '分度圆|压力角');
+  ok(f2.correct === false && f2.fill[0].ok === true && f2.fill[1].ok === false, '填空：错一空逐空标记', f2);
+  ok(S.grade('TF1', '分度圆').correct === false, '填空：空数不齐按空串判错');
+  ok(S.grade('TF1', ' 分度圆 ｜ 模数。').correct === true, '填空：全角竖线/首尾空白/句号归一');
+  ok(S.grade('TF1', '|').correct === false, '填空：全空不得分');
+  ok(S.grade('TF2', '对|错|对').correct === true, '填空哨兵：答案含对错字面仍走填空分支');
+  const f3 = S.grade('TF3', '1.5 磅');
+  ok(f3.self === true && f3.correct === null, '填空：①②③式长答案的老数据仍自评（向后兼容）', f3);
+  ok(S.grade('TF1', '分度圆').correct === false, '填空：单空答案题填错 → 正确判错');
+  ok(S.grade('TE1', '指定输出分隔符').self === true, '填空/问答 混合题型不误触新分支');
   eq(S.grade('NOPE', 'x'), { error: 'not found' }, '不存在题号 → not found');
 })();
 
@@ -130,18 +146,18 @@ function synthetic() {
 (function () {
   const S = QBankStatic.make(synthetic(), shimStorage());
   const all = S.pick({ n: 100 });
-  eq(all.length, 15, 'pick 全量');
+  eq(all.length, 18, 'pick 全量');
   eq(S.pick({ n: 0 }).length, 1, 'pick n=0 → clamp 到 1');
-  eq(S.pick({ n: 999 }).length, 15, 'pick n=999 → 返回全部（不足 100）');
+  eq(S.pick({ n: 999 }).length, 18, 'pick n=999 → 返回全部（不足 100）');
   eq(S.pick({ level: 3, n: 100 }).map(x => x.id), ['TL3'], 'pick 按难度过滤');
-  eq(S.pick({ level: 'abc', n: 100 }).length, 15, 'pick 难度非法 → 不过滤');
+  eq(S.pick({ level: 'abc', n: 100 }).length, 18, 'pick 难度非法 → 不过滤');
   eq(S.pick({ qtype: '单选', n: 100 }).map(x => x.id).sort(), ['TB1', 'TS1', 'TS2'], 'pick 按题型过滤');
   eq(S.pick({ bank: '测试库B', n: 100 }).map(x => x.id), ['TB2'], 'pick 按题库过滤');
-  eq(S.pick({ section: 'T. 测试', n: 100 }).length, 14, 'pick 按来源第一段过滤');
+  eq(S.pick({ section: 'T. 测试', n: 100 }).length, 17, 'pick 按来源第一段过滤');
   eq(S.pick({ section: 'U. 别的', n: 100 }).map(x => x.id), ['TU1'], 'pick 按来源过滤（另一段）');
   eq(S.pick({ qtype: '单选', bank: '测试库B', n: 100 }).length, 0, 'pick 多条件交集为空');
   const row = all[0];
-  eq(Object.keys(row).sort(), ['bank', 'cat', 'id', 'level', 'options', 'qtype', 'sec', 'source_class', 'stem'], 'pick 行字段与服务端 _pub_row 一致');
+  eq(Object.keys(row).sort(), ['bank', 'cat', 'fill_n', 'id', 'level', 'options', 'qtype', 'sec', 'source_class', 'stem'], 'pick 行字段与服务端 _pub_row 一致');
   // only_new
   S.mark('TS1', 'correct'); S.mark('TS2', 'wrong');
   const fresh = S.pick({ only_new: true, n: 100 }).map(x => x.id);
@@ -173,10 +189,10 @@ function synthetic() {
   const S = QBankStatic.make(synthetic(), shimStorage());
   const bs = S.banks();
   eq(bs.map(x => x.bank), ['测试库', '测试库B'], 'banks 按数量降序');
-  eq(bs[0].n, 14, 'banks 计数');
+  eq(bs[0].n, 17, 'banks 计数');
   const ss = S.sections();
   eq(ss.map(x => x.section), ['T. 测试', 'U. 别的'], 'sections 聚合第一段');
-  eq(ss[0].n, 14, 'sections 计数');
+  eq(ss[0].n, 17, 'sections 计数');
   eq(S.cards('', '', 500).length, 3, 'cards 全量');
   eq(S.cards('V形块', '', 500).map(c => c.name), ['V形块'], 'cards 关键词');
   eq(S.cards('V形块', '', 500)[0].qids, ['TS1'], 'cards qids 已解析为数组');
@@ -195,11 +211,11 @@ function synthetic() {
   ok(w[0].state === 'wrong' && w[0].streak === 0, '错题本带进度字段');
   const st = S.stats();
   eq(st.mode, 'static', 'stats mode');
-  eq([st.total, st.cards], [15, 3], 'stats 总量');
+  eq([st.total, st.cards], [18, 3], 'stats 总量');
   eq([st.answered, st.correct, st.wrong], [3, 1, 2], 'stats 已答/掌握/错题');
   eq(st.by_level['3'], 1, 'stats 难度分布');
-  eq(st.by_type, { '判断': 3, '单选': 3, '多选': 2, '问答': 6, '填空': 1 }, 'stats 题型按主类型聚合');
-  eq(st.by_class, { '自出': 15 }, 'stats 来源分级');
+  eq(st.by_type, { '判断': 3, '单选': 3, '多选': 2, '问答': 6, '填空': 4 }, 'stats 题型按主类型聚合');
+  eq(st.by_class, { '自出': 18 }, 'stats 来源分级');
   eq(st.intervals, [1, 3, 7, 15, 30, 60], 'stats 间隔');
   eq(st.due, 0, 'stats 待复习（刚答的未到期）');
   ok(st.today >= 3 && st.today_ok === 1, 'stats 今日已学/答对', { today: st.today, today_ok: st.today_ok });
@@ -256,7 +272,7 @@ function synthetic() {
   const storage = shimStorage();
   const S = QBankStatic.make(synthetic(), storage);
   const base = S.stats().total;                    // 合成库 15 题
-  eq(base, 15, '合成库 15 题');
+  eq(base, 18, '合成库 18 题');
   // 模板结构：_readme + questions 数组，3 道示例题
   const tpl = S.export_template();
   ok(typeof tpl._readme === 'string' && tpl._readme.length > 20, '模板含说明文字');
@@ -321,7 +337,7 @@ function synthetic() {
   // 存储损坏/不可读不崩
   const badStore = { getItem: () => '{坏 json', setItem: () => {}, removeItem: () => {} };
   const S5 = QBankStatic.make(synthetic(), badStore);
-  eq(S5.stats().total, 15, 'localStorage 内容损坏时降级为空自定义库');
+  eq(S5.stats().total, 18, 'localStorage 内容损坏时降级为空自定义库');
   ok(S5.merge_questions(tpl.questions, 'skip').added === 3, '存储损坏时仍可导入（内存生效）');
   // 空数组/非数组入参
   eq(S.merge_questions(null, 'skip').rejected.length, 0, 'null 入参不拒绝不崩溃');
@@ -455,6 +471,31 @@ function synthetic() {
   const q = S.question('TS1');
   eq([q.id, q.qtype, q.answer], ['TS1', '单选', undefined], 'question：返回单题且不含答案');
   eq(S.question('NOPE'), null, 'question：不存在返回 null');
+})();
+
+// ================= 自定义题：导入 / 判分 / 列表 / 删除 =================
+(function () {
+  const st = shimStorage();
+  const S = QBankStatic.make(synthetic(), st);
+  const r = S.merge_questions([
+    { id: 'XZ1', stem: '齿轮的【1】圆是分度基准', qtype: '填空', answer: '分度圆', bank: 'PDF 自建' },
+    { id: 'XZ2', stem: '平键能传递轴向力', qtype: '判断', answer: '错', bank: 'PDF 自建' },
+    { id: 'TJ1', stem: '撞内置题号', qtype: '判断', answer: '对' },
+  ], 'skip');
+  eq([r.added, r.rejected.length], [2, 1], '自定义题：导入两道 + 撞内置号被拒');
+  const g = S.grade('XZ1', '分度圆');
+  ok(g.correct === true, '自定义题：导入后可直接判分', g);
+  ok(S.grade('XZ2', '错').correct === true, '自定义题：判断题判分', S.grade('XZ2', '错'));
+  eq(S.custom_list().map(x => x.id), ['XZ1', 'XZ2'], '自定义题：列表');
+  S.mark('XZ1', 'correct');
+  eq(S.stats().answered, 1, '自定义题：作答计入 stats');
+  ok(S.remove_custom('XZ1') === true, '自定义题：删除返回 true');
+  eq(S.stats().answered, 0, '自定义题：删除时级联清进度（stats 不虚高）');
+  eq(S.custom_list().map(x => x.id), ['XZ2'], '自定义题：删除后只剩一道');
+  ok(S.remove_custom('XZ1') === false, '自定义题：重复删除返回 false');
+  eq(S.grade('XZ1', '分度圆').error, 'not found', '自定义题：删除后判分 not found');
+  const S2 = QBankStatic.make(synthetic(), st);
+  eq(S2.custom_list().map(x => x.id), ['XZ2'], '自定义题：变更已持久化到 localStorage');
 })();
 
 // ---- 汇总 ----

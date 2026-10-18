@@ -491,14 +491,20 @@ def main() -> int:
     tmp = db.with_suffix('.sqlite.new')          # 先写临时文件：App 开着（句柄被占）也能重建
     if tmp.exists(): tmp.unlink()
     # 迁移旧库学习进度：重建不丢刷题记录（旧库被 App 占用读不到时跳过并记录待办）
-    old_prog = []
+    # 同时迁移自定义题（PDF 摘录编辑器保存的用户题，source_class=自定义）：
+    # 本脚本用临时库整体替换 qbank.sqlite，不过滤的话重建一次用户题全没。
+    old_prog, old_custom = [], []
     if db.exists():
         try:
             oc = sqlite3.connect(db)
             old_prog = oc.execute('SELECT id,state,streak,wrong,due,last_seen FROM progress').fetchall()
+            old_custom = oc.execute(
+                'SELECT id,bank,source_class,section_path,section,cat_name,stem,qtype,level,'
+                'options,answer,explanation,source,note,meta FROM questions WHERE source_class=?',
+                ('自定义',)).fetchall()
             oc.close()
         except Exception as e:
-            problems.append(f'旧库进度读取失败（未迁移）：{e}')
+            problems.append(f'旧库进度/自定义题读取失败（未迁移）：{e}')
     con = sqlite3.connect(tmp)
     con.executescript('''
       CREATE TABLE questions(
@@ -521,7 +527,10 @@ def main() -> int:
     con.executemany('INSERT OR REPLACE INTO questions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [(q['id'], q['bank'], q['source_class'], q['section_path'], q['section'], q.get('cat_name',''),
           q['stem'], q['qtype'], q['level'], json.dumps(q['options'], ensure_ascii=False),
-          q['answer'], q['explanation'], q['source'], q['note'], q['meta']) for q in allq])
+          q['answer'], q['explanation'], q['source'], q['note'], q['meta']) for q in allq]
+        + [tuple(r) for r in old_custom])     # 自定义题追加：INSERT OR REPLACE 同 id 以源淬取为准
+    if old_custom:
+        print('已迁移旧库自定义题 %d 条（source_class=自定义，PDF 摘录编辑器保存）' % len(old_custom))
     con.executemany('INSERT INTO cards(chapter,topic,name,body,qids,source_class) VALUES(?,?,?,?,?,?)',
         [(c['chapter'], c['topic'], c['name'], c['body'], json.dumps(c['qids']), c['source_class']) for c in cards])
     con.commit()
@@ -547,7 +556,8 @@ def main() -> int:
              f'- 源：`{F}`（**只读**，未改写任何源文件）',
              f'- 主库 **{len(qs)}** 题 ｜ 学习库 **{len(learn)}** 题 ｜ 合计 **{len(allq)}**',
              f'- 知识点卡片 **{len(cards)}**',
-             f'- 迁移旧库学习进度 **{len(old_prog)}** 条', '', '## 来源分级（决定能否公开）', '',
+             f'- 迁移旧库学习进度 **{len(old_prog)}** 条',
+             f'- 迁移旧库自定义题 **{len(old_custom)}** 条（PDF 摘录编辑器保存，重建不丢）', '', '## 来源分级（决定能否公开）', '',
              '| 来源分级 | 题数 | 公开 |', '|---|---:|---|']
     for k, v in byclass.most_common():
         lines.append(f'| {k} | {v} | {"✅" if k in PUBLIC_CLASSES else "⛔ 仅本地"} |')

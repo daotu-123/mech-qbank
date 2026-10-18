@@ -12,7 +12,7 @@ REM subset for first run; drop your own data\qbank.sqlite next to the exe for th
 cd /d "%~dp0"
 if not exist web\dist\index.html (
   echo [ERROR] web\dist\index.html not found. Run "cd web ^&^& npm run build" first.
-  pause & exit /b 1
+  exit /b 1
 )
 if not exist .venv-build (
   where py >nul 2>nul && (py -3 -m venv .venv-build) || (python -m venv .venv-build)
@@ -32,11 +32,11 @@ REM   lifespan.on     - auto lifespan (used even without lifespan events)
   --distpath dist --workpath build --specpath build app\api.py
 if not exist dist\mech-qbank.exe (
   echo [ERROR] PyInstaller did not produce dist\mech-qbank.exe
-  pause & exit /b 1
+  exit /b 1
 )
 echo.
 echo Done: dist\mech-qbank.exe
 echo Windowed build: double-click opens the browser, no console window.
 echo Quit via the page footer button; logs go to dist\qbank.log
 echo Put your own data\qbank.sqlite next to the exe to use the full library.
-pause
+

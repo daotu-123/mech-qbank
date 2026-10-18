@@ -5,6 +5,7 @@ import ReviewView from '@/views/ReviewView.vue'
 import WrongView from '@/views/WrongView.vue'
 import CardsView from '@/views/CardsView.vue'
 import StatsView from '@/views/StatsView.vue'
+import ExcerptView from '@/views/ExcerptView.vue'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -14,6 +15,7 @@ const router = createRouter({
     { path: '/wrong', name: 'wrong', component: WrongView },
     { path: '/cards', name: 'cards', component: CardsView },
     { path: '/stats', name: 'stats', component: StatsView },
+    { path: '/excerpt', name: 'excerpt', component: ExcerptView },
   ],
   scrollBehavior() { return { top: 0 }; }
 });
