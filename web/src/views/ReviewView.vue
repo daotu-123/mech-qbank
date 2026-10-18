@@ -32,7 +32,7 @@ async function load() {
 }
 function begin() {
   startSession(items.value, '今日复习');
-  router.push('/');
+  router.push('/quiz');
 }
 onMounted(load);
 </script>

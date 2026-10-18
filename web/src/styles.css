@@ -175,3 +175,62 @@ footer{color:var(--muted);font-size:12px;text-align:center;padding:22px 0}
 /* ---- Element Plus 控件微调：与旧版 select/按钮的高度气质对齐 ---- */
 .el-select{--el-select-width:auto}
 .el-input__wrapper{border-radius:8px}
+
+/* ================================================================
+   今日学习台（首页）
+   设计依据：仪表盘每卡只放 1–3 个数字，详情点进去；
+   三个明确入口，不做筛选、不做组卷。
+   ================================================================ */
+.today-hero{padding:22px 20px}
+.today-line b{font-size:21px;font-weight:700;letter-spacing:-.3px;line-height:1.35}
+.today-meta{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+  font-size:13px;color:var(--muted)}
+.today-meta b{color:var(--ink);font-variant-numeric:tabular-nums}
+.today-meta .dot{color:#c9ced6}
+
+.today-actions{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px}
+.today-btn{display:flex;flex-direction:column;align-items:flex-start;gap:4px;
+  border:1px solid var(--line);background:#fff;border-radius:10px;padding:16px 18px;
+  cursor:pointer;font:inherit;text-align:left;transition:border-color .15s,transform .08s}
+.today-btn:hover:not(:disabled){border-color:var(--steel)}
+.today-btn:active:not(:disabled){transform:translateY(1px)}
+.today-btn:disabled{opacity:.45;cursor:not-allowed}
+.today-btn .tb-title{font-size:15px;font-weight:650;color:var(--ink)}
+.today-btn .tb-sub{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.today-btn.primary{background:var(--steel);border-color:var(--steel)}
+.today-btn.primary .tb-title{color:#fff}
+.today-btn.primary .tb-sub{color:rgba(255,255,255,.82)}
+
+.today-progress{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:13px 18px;
+  font-size:13px;color:var(--muted)}
+.today-progress b{color:var(--ink);font-variant-numeric:tabular-nums}
+.today-progress .dot{color:#c9ced6}
+
+/* ================================================================
+   响应式（此前全文 0 个 @media，375px 屏必溢出）
+   断点：768（平板/横屏手机）、480（主流手机）、375（小屏）
+   ================================================================ */
+@media (max-width: 768px) {
+  .today-actions{grid-template-columns:1fr;gap:10px}
+  .today-btn{padding:14px 16px}
+  nav a{padding:10px 11px;font-size:13px}
+  .card{padding:14px}
+}
+
+@media (max-width: 480px) {
+  .today-hero{padding:18px 15px}
+  .today-line b{font-size:18px}
+  .today-meta{font-size:12px;gap:6px}
+  nav a svg{display:none}
+  nav a{padding:10px 8px;font-size:12.5px}
+  .wrap{padding-left:10px;padding-right:10px}
+  /* 筛选条此前写死 220/240px 宽，小屏会溢出 */
+  .cond-bar .cond-chip{max-width:100%}
+  .row{gap:8px}
+}
+
+@media (max-width: 375px) {
+  nav a{padding:9px 6px;font-size:12px}
+  .today-line b{font-size:17px}
+  .today-btn .tb-title{font-size:14px}
+}
