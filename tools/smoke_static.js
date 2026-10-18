@@ -155,9 +155,16 @@ function synthetic() {
   eq(S.pick({ bank: '测试库B', n: 100 }).map(x => x.id), ['TB2'], 'pick 按题库过滤');
   eq(S.pick({ section: 'T. 测试', n: 100 }).length, 17, 'pick 按来源第一段过滤');
   eq(S.pick({ section: 'U. 别的', n: 100 }).map(x => x.id), ['TU1'], 'pick 按来源过滤（另一段）');
+  // ---- 组卷顺序：按题型标签排序（单选→多选→判断→填空→问答→识记→综合→计算）----
+  const seq = S.pick({ n: 100 }).map(x => x.qrank);
+  ok(seq.every((v, i) => i === 0 || seq[i - 1] <= v), 'pick 按题型标签排序（qrank 非递减）', seq);
+  ok(seq[0] === 1 && seq[seq.length - 1] === 5, '合成库首题单选、末题问答（无计算题）', [seq[0], seq[seq.length - 1]]);
+  const s1 = S.pick({ n: 100 }).map(x => x.id).join(',');
+  const s2 = S.pick({ n: 100 }).map(x => x.id).join(',');
+  ok(s1 !== s2, '同题型内顺序随机（两次组卷不全同）');
   eq(S.pick({ qtype: '单选', bank: '测试库B', n: 100 }).length, 0, 'pick 多条件交集为空');
   const row = all[0];
-  eq(Object.keys(row).sort(), ['bank', 'cat', 'fill_n', 'id', 'level', 'options', 'qtype', 'sec', 'source_class', 'stem'], 'pick 行字段与服务端 _pub_row 一致');
+  eq(Object.keys(row).sort(), ['bank', 'cat', 'fill_n', 'id', 'level', 'options', 'qrank', 'qtype', 'sec', 'source_class', 'stem'], 'pick 行字段与服务端 _pub_row 一致');
   // only_new
   S.mark('TS1', 'correct'); S.mark('TS2', 'wrong');
   const fresh = S.pick({ only_new: true, n: 100 }).map(x => x.id);
@@ -471,6 +478,37 @@ function synthetic() {
   const q = S.question('TS1');
   eq([q.id, q.qtype, q.answer], ['TS1', '单选', undefined], 'question：返回单题且不含答案');
   eq(S.question('NOPE'), null, 'question：不存在返回 null');
+})();
+
+// ================= 组卷顺序：题型标签（隐藏 qrank）=================
+(function () {
+  const q = (id, qtype) => ({ id, stem: id, qtype, answer: 'x', options: [], level: 1, bank: 'T' });
+  const S6 = QBankStatic.make({ questions: [
+    q('A1', '计算'), q('A2', '综合'), q('A3', '识记'), q('A4', '问答'),
+    q('A5', '填空'), q('A6', '判断'), q('A7', '多选'), q('A8', '单选'),
+    q('A9', '填空/问答'), q('A10', '计算/问答'), q('A11', ''),
+  ], cards: [] }, shimStorage());
+  const rows = S6.pick({ n: 100 });
+  const ranks = rows.map(x => x.qrank);
+  // 同档内是随机序（如「填空」与「填空/问答」同为 4 档），所以断言「档位非递减 + 各档成员集合」，
+  // 不硬编码整条序列，否则会 flaky。
+  ok(ranks.every((v, i) => i === 0 || ranks[i - 1] <= v),
+     '组卷顺序：单选→多选→判断→填空→问答→识记→综合→计算（qrank 非递减，计算垫底）', ranks);
+  eq(rows[0].qtype, '单选', '组卷首题是单选');
+  eq(ranks[ranks.length - 1], 8, '组卷末位是 8 档（计算）');
+  const at = r => rows.filter(x => x.qrank === r).map(x => x.qtype).sort().join('|');
+  eq(at(1), '单选', '1 档只有单选');
+  eq(at(2), '多选', '2 档只有多选');
+  eq(at(3), '判断', '3 档只有判断');
+  eq(at(4), '填空|填空/问答', '4 档：填空 与 填空/问答（先命中填空）');
+  eq(at(5), '问答', '5 档只有问答');
+  eq(at(6), '|识记', '6 档：识记 与未标注题型（未标注落 6，不抢计算末位）');
+  eq(at(7), '综合', '7 档只有综合');
+  eq(at(8), '计算|计算/问答', '8 档：计算 与 计算/问答（计算优先命中，混合题也垫底）');
+  eq(ranks.slice().sort((a, b) => a - b), [1, 2, 3, 4, 4, 5, 6, 6, 7, 8, 8], 'qrank 标签值分布');
+  eq(S6.question('A9').qrank, 4, '混合题型「填空/问答」按先命中定档 4');
+  eq(S6.question('A10').qrank, 8, '混合题型「计算/问答」定档 8（计算垫底优先）');
+  eq(S6.question('A11').qrank, 6, '未标注题型落 6，不抢计算题末位');
 })();
 
 // ================= 自定义题：导入 / 判分 / 列表 / 删除 =================

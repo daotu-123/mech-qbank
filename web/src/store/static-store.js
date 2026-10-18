@@ -63,6 +63,20 @@ function fillSlots(q) {
   if (ans.indexOf('|') >= 0) return ans.split('|').length;
   return (qt === '填空' && ans.length <= 20 && !/[①②③④⑤⑥；;]/.test(ans)) ? 1 : 0;
 }
+// 组卷的题型排序标签（隐藏，只用于排序不显示）：单选→多选→判断→填空/问答/识记/综合→计算
+// 与 core.py 的 QT_RANK / QT_MATCH_ORDER / qtype_rank 同序（parity 差分兜底）
+const QT_RANK = { '单选': 1, '多选': 2, '判断': 3, '填空': 4,
+                  '问答': 5, '识记': 6, '综合': 7, '计算': 8 };
+// 匹配顺序 ≠ 档位顺序：「计算」提前到「问答」之前判，让「计算/问答」这类混合题也垫底
+const QT_MATCH_ORDER = ['单选', '多选', '判断', '填空', '计算', '问答', '识记', '综合'];
+const RANK_UNKNOWN = 6;   // 未标注题型落在「识记」一档，不抢计算题的末位
+function qtypeRank(qtype) {
+  const qt = String(qtype == null ? '' : qtype);
+  for (let i = 0; i < QT_MATCH_ORDER.length; i++) {
+    if (qt.indexOf(QT_MATCH_ORDER[i]) >= 0) return QT_RANK[QT_MATCH_ORDER[i]];
+  }
+  return RANK_UNKNOWN;
+}
 function sec0(sp) { return String(sp || '').split(' › ')[0].trim(); }   // core.py：section_path 第一段
 function monthStr(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1); }
 function dayKey(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
@@ -217,7 +231,8 @@ export function make(DATA, storage) {
     return { id: q.id, stem: q.stem, qtype: q.qtype, level: q.level,
              options: q.options || [], cat: q.cat_name, bank: q.bank,
              source_class: q.source_class, sec: sec0(q.section_path),
-             fill_n: fillSlots(q) };   // 只暴露空数、不暴露答案（与 core.py _pub_row 同口径）
+             fill_n: fillSlots(q),          // 只暴露空数、不暴露答案（与 core.py _pub_row 同口径）
+             qrank: qtypeRank(q.qtype) };   // 题型排序标签（隐藏，不渲染）
   }
 
   // ---- 判分（与 core.py Store.grade 同源）----
@@ -335,7 +350,11 @@ export function make(DATA, storage) {
       const j2 = Math.floor(Math.random() * (i + 1));
       const t = list[i]; list[i] = list[j2]; list[j2] = t;
     }
-    return list.slice(0, n).map(pubRow);
+    // 先取 n 道再按题型标签稳定排序（组内随机、组间有序，与 core.py pick() 同序）：
+    // 不能先排序再 slice——那样单选会占满名额，一套题全变成单选。
+    const picked = list.slice(0, n);
+    picked.sort((a, b) => qtypeRank(a.qtype) - qtypeRank(b.qtype));
+    return picked.map(pubRow);
   }
 
   function search(kw, limit) {

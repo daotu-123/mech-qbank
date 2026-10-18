@@ -54,6 +54,24 @@ TRUE_SET = {'对', '正确', '是', '√', '✓', 'true', 't', 'yes', 'y', '1'}
 FALSE_SET = {'错', '错误', '否', '×', '✗', 'x', 'false', 'f', 'no', '0', '2'}
 SRV = None          # 运行入口里赋值，供 /api/system/shutdown 用
 
+# 组卷的题型排序标签（隐藏字段，只用于排序不显示）：
+# 先选择（单选→多选）、再判断，填空/问答/识记/综合居中，计算垫底。
+# 与 web/src/store/static-store.js 的 QT_RANK / qtypeRank 同序（parity 差分兜底）。
+QT_RANK = {'单选': 1, '多选': 2, '判断': 3, '填空': 4, '问答': 5, '识记': 6, '综合': 7, '计算': 8}
+# 匹配顺序 ≠ 档位顺序：「计算」提前到「问答」之前判，让「计算/问答」这类混合题也垫底
+QT_MATCH_ORDER = ('单选', '多选', '判断', '填空', '计算', '问答', '识记', '综合')
+RANK_UNKNOWN = 6    # 未标注题型落在「识记」一档，不抢计算题的末位
+
+
+def qtype_rank(qtype: str) -> int:
+    """题型 → 组卷排序序号（越小越靠前）。混合题型按 QT_MATCH_ORDER 先命中者定档
+    （'填空/问答' → 4，'计算/问答' → 8：带计算的题一律垫底）。"""
+    qt = qtype or ''
+    for k in QT_MATCH_ORDER:
+        if k in qt:
+            return QT_RANK[k]
+    return RANK_UNKNOWN
+
 
 def _log_path() -> str:
     """frozen 时日志放 exe 同级 qbank.log（windowed 打包没有控制台，排障全靠它）。
@@ -316,6 +334,7 @@ class Store:
                 args += [seg, like_escape(seg) + ' › %']
         w = (' WHERE ' + ' AND '.join(where)) if where else ''
         if review:
+            # 今日复习按到期时间排（复习节奏优先，不套题型顺序）
             rows = self.q('SELECT q.* FROM questions q JOIN progress p ON p.id=q.id'
                           ' WHERE p.due IS NOT NULL AND p.due<=?'
                           + (' AND ' + ' AND '.join(where) if where else '')
@@ -324,7 +343,11 @@ class Store:
             if only_new:
                 where.append("id NOT IN (SELECT id FROM progress WHERE state IN ('correct','wrong'))")
                 w = ' WHERE ' + ' AND '.join(where)
+            # 先随机抽 n 道（保证题型配比随题库分布），再按题型标签稳定排序：
+            # 单选 → 多选 → 判断 → 填空/问答/识记/综合 → 计算垫底；同题型内保持随机序。
+            # 不能写成 ORDER BY CASE..., RANDOM() LIMIT n——那样单选会占满名额，一套题全变成单选。
             rows = self.q('SELECT * FROM questions' + w + ' ORDER BY RANDOM() LIMIT ?', (*args, n))
+            rows.sort(key=lambda r: qtype_rank(r['qtype']))
         return [self._pub_row(r) for r in rows]
 
     def _pub_row(self, r) -> dict:
@@ -334,7 +357,9 @@ class Store:
                 'options': json.loads(r['options'] or '[]'), 'cat': r['cat_name'], 'bank': r['bank'],
                 'source_class': r['source_class'], 'sec': sp.split(' › ')[0] if sp else '',
                 # 只暴露空数、不暴露答案：前端据此渲染 N 个输入框（防答案泄露前提下的 UI 决策）
-                'fill_n': fill_slots(r['qtype'], ans)}
+                'fill_n': fill_slots(r['qtype'], ans),
+                # 题型排序标签（隐藏）：UI 不渲染，供组卷排序与测试断言用，两端同口径
+                'qrank': qtype_rank(r['qtype'])}
 
     def full(self, qid: str):
         rows = self.q('SELECT * FROM questions WHERE id=?', (qid,))

@@ -165,6 +165,13 @@ def api_smoke(m, public: bool):
         check('GET /questions?limit=3', code == 200 and len(d.get('items', [])) <= 3)
         code, d, _ = jget('/questions?n=99999&limit=99999')
         check('limit 过大被内部夹到 ≤100', code == 200 and len(d.get('items', [])) <= 100)
+        code, d, _ = jget('/questions?limit=100')
+        ranks = [it.get('qrank') for it in d.get('items', [])]
+        check('组卷行带隐藏题型标签 qrank，且不下发 answer',
+              code == 200 and len(ranks) > 10 and all(isinstance(r, int) for r in ranks)
+              and all('answer' not in it for it in d.get('items', [])), ranks[:12])
+        check('组卷顺序按 qrank 升序（单选→多选→判断→…→计算垫底）',
+              ranks == sorted(ranks), ranks)
         code, d, _ = jget('/questions?level=abc')
         check('level=abc → 422（FastAPI 参数校验）', code == 422, code)
         code, d, _ = jget('/questions?review=1&limit=5')

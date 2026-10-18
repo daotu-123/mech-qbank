@@ -115,6 +115,9 @@ for (var i = 0; i < d.questions.length; i++) {
   due.push(s.mark(q.id, 'wrong').due.slice(0, 10));
   due.push(s.mark(q.id, 'skip').due.slice(0, 10));
   res._due = due;
+  // 题型排序标签（隐藏字段）：两端必须同档，否则组卷顺序会分叉
+  var row = s.question(q.id);
+  res._qrank = row ? row.qrank : null;
   out[q.id] = res;
 }
 fs.writeFileSync(process.argv[4], JSON.stringify(out), 'utf-8');
@@ -187,11 +190,12 @@ def main() -> int:
                        for k in range(len(iv))]
         res['_due'].append((base + timedelta(days=server.WRONG_BACK)).strftime('%Y-%m-%d'))
         res['_due'].append((base + timedelta(days=server.SKIP_BACK)).strftime('%Y-%m-%d'))
+        res['_qrank'] = server.qtype_rank(q['qtype'])   # 题型排序标签（隐藏）
         py[q['id']] = res
 
     js = run_js(node, qs, iv)
 
-    bad_grade, bad_due = [], []
+    bad_grade, bad_due, bad_rank = [], [], []
     for q in qs:
         qid, pr = q['id'], py[q['id']]
         jr = js.get(qid) or {}
@@ -200,21 +204,26 @@ def main() -> int:
                 bad_grade.append((qid, g, pr[g], jr.get(g)))
         if pr['_due'] != jr.get('_due'):
             bad_due.append((qid, pr['_due'], jr.get('_due')))
+        if pr['_qrank'] != jr.get('_qrank'):
+            bad_rank.append((qid, q['qtype'], pr['_qrank'], jr.get('_qrank')))
 
     print('  判分比对点 %d ｜ 不一致 %d' % (len(qs) * len(GIVENS), len(bad_grade)))
     print('  排期比对点 %d ｜ 不一致 %d' % (len(qs), len(bad_due)))
+    print('  题型标签比对点 %d ｜ 不一致 %d' % (len(qs), len(bad_rank)))
 
     for qid, g, a, b in bad_grade[:8]:
         print('  ✗ %s given=%r\n      py=%s\n      js=%s' % (qid, g, a, b))
     for qid, a, b in bad_due[:5]:
         print('  ✗ %s 排期不一致\n      py=%s\n      js=%s' % (qid, a, b))
+    for qid, qt, a, b in bad_rank[:8]:
+        print('  ✗ %s 题型标签不一致 qtype=%r py=%r js=%r' % (qid, qt, a, b))
 
     st.con.close()
     shutil.rmtree(tmpdb, ignore_errors=True)
-    if bad_grade or bad_due:
+    if bad_grade or bad_due or bad_rank:
         print('\n✗ 两端不一致 —— 改 core.py 或 static-store.js 时必须同步另一端')
         return 1
-    print('✓ 两端判分与排期完全一致（间隔 %s 天）' % '/'.join(str(x) for x in iv))
+    print('✓ 两端判分、排期与题型标签完全一致（间隔 %s 天）' % '/'.join(str(x) for x in iv))
     return 0
 
 
