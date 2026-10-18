@@ -173,6 +173,13 @@ def store_smoke(m, st, public: bool):
     check('pick clamp：n=abc 不炸', len(st.pick('abc')) > 0)
     check('pick clamp：n=99999 ≤100', len(st.pick(99999)) <= 100)
     check('pick 不泄露答案', all('answer' not in i for i in st.pick(10)))
+    # 回归：limit 必须是 n 的合法别名。前端 api.js 与 FastAPI 都用 limit 命名，
+    # 历史上 pick(limit=...) 会 TypeError，且 server.py 读 n 导致前端传的题数被忽略。
+    try:
+        got = len(st.pick(limit=5))
+        check('pick(limit=5) 别名可用且生效', got == 5)
+    except TypeError as e:
+        check('pick(limit=5) 别名可用且生效', False)
     if public:
         ids = {i['id'] for i in st.pick(200, only_new=True)}
         check('only_new 排除已答对/答错', qid not in ids)
@@ -366,6 +373,12 @@ def http_smoke(m, tmp: Path, public: bool):
         check('n=99999 被夹到 ≤100', code == 200 and len(d['items']) <= 100)
         code, d = jget('/api/review?n=5')
         check('GET /api/review', code == 200 and isinstance(d['items'], list))
+        # 回归：前端 api.js 一直传 limit，而 server.py 早先只读 n，导致题数被静默忽略；
+        # 且 /api/review 默认曾是 20、与 /api/quiz 的 10 不一致。
+        code, d = jget('/api/quiz?limit=3')
+        check('GET /api/quiz?limit=3（前端实际传法）', code == 200 and len(d['items']) == 3)
+        code, d = jget('/api/review?limit=4')
+        check('GET /api/review?limit=4（前端实际传法）', code == 200 and len(d['items']) <= 4)
         code, d = jget('/api/search?q=' + urllib.parse.quote('轴承'))
         check('GET /api/search', code == 200 and isinstance(d['items'], list))
         code, d = jget('/api/search?q=%25')

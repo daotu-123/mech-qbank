@@ -313,7 +313,11 @@ class Store:
                 'intervals': INTERVALS}
 
     def pick(self, n=10, level=None, qtype=None, sclass=None, bank=None, section=None,
-             only_new=False, review=False) -> list:
+             only_new=False, review=False, limit=None) -> list:
+        # limit 是 n 的别名：前端 api.js 与 FastAPI 端点都用 limit 命名，
+        # 历史上直接传 pick(limit=...) 会 TypeError（见 tools/smoke_parity.py 的回归断言）。
+        if limit is not None:
+            n = limit
         n = clamp_int(n, 10, 1, 100)
         where, args = [], []
         if level not in (None, ''):

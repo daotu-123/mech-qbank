@@ -50,6 +50,23 @@ from core import *                                   # noqa: F401,F403 数据层
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
 
 
+def _n_arg(q: dict, default: int = 10) -> int:
+    """统一读取「一次取多少题」的参数。
+
+    历史遗留：前端 api.js 一直传 query 参数 `limit`，而本文件早期读的是 `n`，
+    导致前端传的数量被静默忽略、永远落到默认值；且 /api/review 的默认曾是 20
+    与 /api/quiz 的 10 不一致。此处统一为：同时接受 n 与 limit，默认 10。
+    """
+    for key in ('n', 'limit'):
+        v = q.get(key)
+        if v not in (None, ''):
+            try:
+                return int(v[0] if isinstance(v, (list, tuple)) else v)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
 # ---------------------------------------------------------------- HTTP
 class H(BaseHTTPRequestHandler):
     server_version = 'mech-qbank/1.0'
@@ -106,11 +123,12 @@ class H(BaseHTTPRequestHandler):
             if p == '/api/stats':
                 return self.j(STORE.stats())
             if p == '/api/quiz':
-                return self.j({'items': STORE.pick(q.get('n', 10), q.get('level'), q.get('qtype'),
+                return self.j({'items': STORE.pick(_n_arg(q), q.get('level'), q.get('qtype'),
                                                    q.get('class'), q.get('bank'), q.get('section'),
                                                    q.get('only_new') == '1', q.get('review') == '1')})
             if p == '/api/review':
-                return self.j({'items': STORE.pick(q.get('n', 20), q.get('level'), q.get('qtype'),
+                # 与 /api/quiz、api.py、api.js 保持同一默认（10），参数名同时接受 n 与 limit
+                return self.j({'items': STORE.pick(_n_arg(q), q.get('level'), q.get('qtype'),
                                                    review=True)})
             if p == '/api/search':
                 return self.j({'items': STORE.search(q.get('q', ''), q.get('limit', 50))})
