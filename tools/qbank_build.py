@@ -505,6 +505,48 @@ def parse_cards(path: Path) -> list[dict]:
                           'qids': re.findall(r'`(Q\d{3,5})`', body)})
     return cards
 
+def load_selfauthored() -> list[dict]:
+    """加载仓库内的**原创自研题库**（data/selfauthored/questions.json）。
+
+    背景（2026-10-18）：公开子集此前 0 道选择题——全库 572 道选择题都来自
+    「公司笔试原卷」区块，按来源分级必须拦下（合规红线）。因此公开版无法刷题。
+    解法不是放宽来源门槛，而是**基于自编知识点卡片原创出题**：题目与选项均为
+    原创，来源分级为「自出」，可安全公开。
+
+    文件为手工维护的单一真相源，由 data/selfauthored/ 随仓库提交。
+    """
+    fp = DATA / 'selfauthored' / 'questions.json'
+    if not fp.exists():
+        return []
+    try:
+        doc = json.loads(fp.read_text(encoding='utf-8'))
+    except Exception as e:
+        print('⚠ data/selfauthored/questions.json 解析失败，已跳过：%s' % e, file=sys.stderr)
+        return []
+
+    out = []
+    for q in doc.get('questions', []):
+        sp = (q.get('section_path') or '').strip()
+        out.append({
+            'id': q['id'],
+            'bank': '自建题库',
+            'source_class': '自出',            # 原创内容，允许公开
+            'section_path': sp,
+            'section': sp.split('›')[-1].strip() if sp else '',
+            'cat_name': q.get('cat_name', ''),
+            'stem': q['stem'],
+            'qtype': q['qtype'],               # 题型已由出题方确定，不再 infer
+            'level': q.get('level'),
+            'options': list(q.get('options') or []),
+            'answer': q.get('answer', ''),
+            'explanation': q.get('explanation', ''),
+            'source': '',
+            'note': '',
+            'meta': '',
+        })
+    return out
+
+
 def main() -> int:
     if not F.is_dir():
         print('未找到源题库目录：%s\n'
@@ -584,7 +626,10 @@ def main() -> int:
         id TEXT PRIMARY KEY, state TEXT DEFAULT 'new', streak INTEGER DEFAULT 0,
         wrong INTEGER DEFAULT 0, due TEXT, last_seen TEXT);
     ''')
-    allq = qs + learn
+    selfauth = load_selfauthored()
+    if selfauth:
+        print('已加载原创自研题 %d 条（data/selfauthored/questions.json）' % len(selfauth))
+    allq = qs + learn + selfauth
     if old_prog:
         con.executemany('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen) VALUES(?,?,?,?,?,?)', old_prog)
         print('已迁移旧库学习进度 %d 条' % len(old_prog))

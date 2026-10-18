@@ -263,8 +263,19 @@ function synthetic() {
 (function () {
   const S = QBankStatic.make(PUB, shimStorage());
   const st = S.stats();
-  eq([st.total, st.cards, st.mode], [76, 387, 'static'], '公开子集：76 题 387 卡');
-  eq(S.pick({ n: 100 }).length, 76, '公开子集可全量组卷');
+  // 期望值从数据推导，不再写死：公开子集是可增长的（2026-10-18 从 76 题增至 266 题，
+  // 新增的 190 道为 data/selfauthored/ 下的原创选择题）。
+  eq([st.total, st.cards, st.mode], [PUB.questions.length, 387, 'static'],
+     `公开子集：${PUB.questions.length} 题 387 卡`);
+  eq(S.pick({ n: 100 }).length, Math.min(100, PUB.questions.length), '公开子集可全量组卷');
+  // 回归：公开子集必须包含可自动判分的选择题。
+  // 历史教训：2026-10-18 之前公开子集 0 单选 0 多选，clone 下来无法刷题——
+  // 因为全库 572 道选择题都来自公司笔试原卷，按来源分级必须拦下（合规红线）。
+  // 解法是原创出题（data/selfauthored/），而非放宽来源门槛。
+  const sel = PUB.questions.filter(q => q.qtype === '单选' || q.qtype === '多选');
+  ok(sel.length >= 150, `公开子集含可判分选择题 ${sel.length} 道（应 ≥150）`);
+  ok(sel.every(q => (q.options || []).length >= 2 && /^[A-H]+$/.test((q.answer || '').trim())),
+     '公开子集选择题结构自洽（≥2 选项 + 纯字母答案）');
   ok(S.banks().length > 0 && S.sections().length > 0, '公开子集 banks/sections 非空');
   ok(S.search('Python').length >= 1, '公开子集搜索可用');
   const first = PUB.questions[0];
