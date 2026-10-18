@@ -107,7 +107,9 @@ def audit(questions, report_path: Path | None = None) -> int:
             kind = '单选但答案多字母'
         elif '多选' in qt and letters and len(letters) == 1:
             kind = '多选但答案单字母'
-        elif letters and len(opts) < 2:
+        elif letters and len(opts) < 2 and rec in ('单选', '多选'):
+            # 只有「建议题型也是选择类」才算问题；图形题的答案恰好是字母（如「（ B ）」）
+            # 但没有文字选项，本就该走自评，不是结构缺陷。
             kind = '字母答案但没有选项'
         elif qt not in (rec,) and any(k in qt for k in SUBJECTIVE) and rec in ('判断',):
             kind = '主观题标注但答案是判断'

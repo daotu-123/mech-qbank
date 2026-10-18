@@ -88,6 +88,8 @@ mech-qbank/
 ├ tools/smoke_parity.py   前后端判分/排期一致性差分测试（改判分逻辑必跑）
 ├ tools/smoke_api.py      冒烟测试：FastAPI RESTful 契约（方法/状态码/白名单/shutdown）
 ├ tools/audit_types.py    题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
+├ tools/audit_choice_answers.py  选择题答案体检：答案文本与选项文本比对，推不出的列人工清单
+├ tools/answer_fix.tsv    人工核定过的答案覆盖表（题号+字母+依据），构建时重放，重建不丢
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
 │ └ public/qbank.json    公开子集（示例数据，入库）

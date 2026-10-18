@@ -266,21 +266,66 @@ def norm_answer(a: str, choice: bool = False) -> str:
     # 注意用 fullmatch/带标点匹配：「对称布置…」这类长答案不能因为首字是「对」就被判成判断题
     if re.search(r'[（(]\s*[√✓对]\s*[）)]', s) or re.fullmatch(r'[√✓对][。.]?', s) or re.match(r'^[√✓对]\s*[。.：:]', s): return '对'
     if re.search(r'[（(]\s*[×✗xX错]\s*[）)]', s) or re.fullmatch(r'[×✗错][。.]?', s) or re.match(r'^[×✗错]\s*[。.：:]', s): return '错'
-    m = re.search(r'(?:答案|参考答案)[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)', s)
+    m = re.search(r'(?:(?:参考)?答案|答)[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)', s)
     if m: return m.group(1).replace(' ', '').replace('，', ',')
-    # `选C：…` / `选 A：…` / 题干里的 `（ A ）` → 提取字母（2026-10-17 补）
-    m = re.search(r'选\s*([A-Ha-h])\s*(?:[：:、.．]|$)', ascii_fw(s))
+    # `答案AD（凸缘联轴器…）` 这种没有冒号的写法（2026-10-19 补）
+    m = re.search(r'答案\s*([A-H]{1,8})(?![A-Za-z])', s)
+    if m: return m.group(1)
+    # `选C：…` / `选A。…` / `（选C）` → 提取字母（2026-10-19 补：原先只认 `选C：` 一种标点，
+    # 源库里大量「选A。齿轮分度圆用细点画线…」「…即v=πdn/1000（选C）。」都被漏成自评）
+    m = re.search(r'选\s*([A-Ha-h])\s*(?:[：:、.．。，()（）]|(?=[^\x00-\x7f])|$)', ascii_fw(s))
     if m: return m.group(1).upper()
     # 只认短答案里的「（A）」，避免把 P(B)、Rmr(c) 这类函数记法当成选项字母
     if len(s) <= 8:
         m = re.search(r'[（(]\s*([A-Ha-h])\s*[）)]', ascii_fw(s))
         if m: return m.group(1).upper()
     if re.fullmatch(r'[A-H](?:\s*[、,，]?\s*[A-H])*', s): return s.replace(' ', '')
+    # 句末括号里的答案字母：`处理（A）。` / `…（B、C、D）。`（2026-10-19 补）
+    # 源库大量题解写成「<正确选项文字>（X）。<解释>」，字母就藏在括号里；此前只在答案 ≤8 字时
+    # 才认括号，长答案全被漏成自评。用 (?<![A-Za-z]) 挡住 P(B)、Rmr(c) 这类函数记法；
+    # 出现 ≥2 组不同字母（如「空1…（A）…空2…（C）」的复合题）则放弃，留给人工。
+    if choice:
+        hits = re.findall(r'(?<![A-Za-z])[（(]\s*([A-H](?:\s*[、,，]\s*[A-H])*)\s*[）)]', ascii_fw(s))
+        picked = {re.sub(r'[、,，\s]', '', h) for h in hits}
+        # 「空1：…（A）…空2：…（C）」这类复合题一个字母代表不了整题答案，宁可留自评
+        compound = bool(re.search(r'空\s*[1-9１-９]', s))
+        if len(picked) == 1 and not compound:
+            return picked.pop()
     if choice:
         # `A（单选·标准答案…）` / `B：直流24伏…` / `A（S136）最贵…` → 取开头连续字母串
         m = re.match(r'^([A-H](?:\s*[、,，/]?\s*[A-H])*)\s*(?:[（(：:．.]|$)', s)
         if m: return re.sub(r'[、,，/\s]', '', m.group(1))
     return s
+
+
+def load_answer_fix() -> dict:
+    """人工逐题核对过的答案覆盖表（`tools/answer_fix.tsv`，随仓库提交，重建时重放）。
+
+    格式：`题号 <TAB> 答案字母 <TAB> 题型(可留空) <TAB> 依据`；`#` 开头为注释。
+    为什么必须有它：源库有一批选择题的「参考答案」写成了题解文本（没有字母），
+    自动提取覆盖不到，逐题核对后的结论若不落盘，每次重建 qbank.sqlite 都会被冲回自评。
+    """
+    p = Path(__file__).resolve().parent / 'answer_fix.tsv'
+    out: dict[str, dict] = {}
+    if not p.exists():
+        return out
+    for ln in p.read_text(encoding='utf-8').splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#'):
+            continue
+        parts = ln.split('\t')
+        if len(parts) < 2:
+            continue
+        qid, letters = parts[0].strip(), parts[1].strip().upper()
+        if not re.fullmatch(r'[A-H]{1,8}', letters):
+            continue
+        out[qid] = {'letters': letters,
+                    'qtype': (parts[2].strip() if len(parts) > 2 else ''),
+                    'note': (parts[3].strip() if len(parts) > 3 else '')}
+    return out
+
+
+ANSWER_FIX = load_answer_fix()
 
 
 def parse_bank(path: Path, bank: str) -> list[dict]:
@@ -422,6 +467,25 @@ def parse_bank(path: Path, bank: str) -> list[dict]:
                 elif q['qtype'] == '判断':
                     q['qtype'] = '填空' if has_blank else '问答'
                     q['ans_bad'] = True
+        # ⑨ 题干里就带着答案字母：`…的正确方法是 （ A ）` / `…的需要注意的是（ AB ）`
+        #    （2026-10-19 补：源库有一批题把答案写进题干括号，唯一一组才认，复合题跳过）
+        if q['options'] and len(q['options']) >= 2 and not re.fullmatch(r'[A-H]+', q['answer'] or ''):
+            hits = {re.sub(r'[、,，\s]', '', h) for h in re.findall(
+                r'[（(]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)\s*[）)]', q['stem'] or '')}
+            if len(hits) == 1:
+                lt = hits.pop()
+                # 题干括号里的字母必须都能在选项范围内（防「（B）个」「（A）型」这类正文写法）
+                if all(ord(ch) - 65 < len(q['options']) for ch in lt):
+                    q['answer'] = lt
+                    q['qtype'] = '多选' if len(lt) > 1 else '单选'
+        # ⑩ 人工判定表 answer_fix.tsv（逐题核对过，优先级最高，重建不丢）
+        fx = ANSWER_FIX.get(q['id'])
+        if fx:
+            q['answer'] = fx['letters']
+            if fx.get('qtype'):
+                q['qtype'] = fx['qtype']
+            elif len(fx['letters']) > 1:
+                q['qtype'] = '多选'
     return items
 
 def parse_cards(path: Path) -> list[dict]:
