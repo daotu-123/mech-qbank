@@ -1,2 +1,4 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
+# FSRS-6 间隔重复（排期核心）。前端对应 ts-fsrs（见 web/package.json）。
+fsrs>=6.3

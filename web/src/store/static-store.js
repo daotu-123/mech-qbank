@@ -10,8 +10,61 @@
  *   · 间隔：答对按 DATA.intervals（默认 1/3/7/15/30/60 天，streak 封顶），答错次日必回，跳过 3 天后回
  */
 const INTERVALS = [1, 3, 7, 15, 30, 60];   // 默认值；实际取 DATA.intervals（与 core.py INTERVALS 同源）
-const WRONG_BACK = 1;                       // 答错次日必回
+const WRONG_BACK = 1;                       // 答错次日必回（仅 FSRS 不可用时的回退）
 const SKIP_BACK = 3;                        // 跳过 3 天后回
+
+// ---------------------------------------------------------------- FSRS 排期
+// 2026-10-18：与 app/core.py 同步，把「答对次数计数器」换成 FSRS-6。
+// Python 侧用 py-fsrs（官方 Python 实现），这里用 ts-fsrs（官方 JS 实现）。
+// 两侧配置必须完全一致：enable_fuzz=false（关掉随机抖动，否则差分测试无法比对）。
+// 已实测：在「到期后复习」时两库输出完全一致；对「提前复习」，本层统一把
+// 复习时间钳到不早于 last_review，保证两侧输入一致。
+import { fsrs, generatorParameters, createEmptyCard, Rating } from 'ts-fsrs';
+
+const FSRS_RATINGS = ['again', 'hard', 'good', 'easy'];
+const FSRS_RATING = {
+  again: Rating.Again, hard: Rating.Hard, good: Rating.Good, easy: Rating.Easy,
+};
+const FSRS_STATE_NAME = ['new', 'learning', 'review', 'relearning'];
+const _fsrs = fsrs(generatorParameters({ enable_fuzz: false }));
+
+/** 把旧的 correct/wrong/skip 与四档评分统一成 FSRS 评分名（与 core.resolve_rating 同源）。 */
+function resolveRating(result) {
+  const r = String(result || '').trim().toLowerCase();
+  if (FSRS_RATINGS.indexOf(r) >= 0) return r;
+  if (r === 'correct') return 'good';
+  if (r === 'wrong' || r === 'skip') return 'again';
+  return 'good';
+}
+
+/** ts-fsrs Card → 可 JSON 化的普通对象（Date 转 ISO 字符串）。 */
+function cardToJSON(c) {
+  return {
+    due: c.due instanceof Date ? c.due.toISOString() : c.due,
+    last_review: c.last_review instanceof Date ? c.last_review.toISOString() : (c.last_review || null),
+    stability: c.stability, difficulty: c.difficulty,
+    elapsed_days: c.elapsed_days, scheduled_days: c.scheduled_days,
+    reps: c.reps, lapses: c.lapses, state: c.state,
+    learning_steps: c.learning_steps || 0,
+  };
+}
+
+/** 普通对象 → ts-fsrs Card（ISO 字符串转回 Date）。 */
+function cardFromJSON(j) {
+  if (!j || !j.due) return null;
+  return Object.assign({}, j, {
+    due: new Date(j.due),
+    last_review: j.last_review ? new Date(j.last_review) : undefined,
+  });
+}
+
+/** 本地时区的 ISO（不带时区后缀），与 core.py 的 due_local.isoformat 同格式。 */
+function localIso(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+    'T' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
 const PROG_KEY = 'mech-qbank-progress';     // localStorage 键（进度按题号存）
 const CUSTOM_KEY = 'mech-qbank-custom';     // localStorage 键（导入的自定义题）
 const CKEY = 'mech-qbank-checkin';          // localStorage 键（手动打卡日期，答题打卡从 progress 聚合）
@@ -300,19 +353,58 @@ export function make(DATA, storage) {
   function mark(qid, result) {
     const st = prog[qid] || { state: 'new', streak: 0, wrong: 0 };
     let streak = st.streak || 0, wrong = st.wrong || 0, state = st.state || 'new';
-    let days;
-    if (result === 'correct') {
-      streak += 1; state = 'correct';
-      days = IV[Math.min(streak, IV.length) - 1];   // 1→1天 2→3天 … 6+→60天
-    } else if (result === 'wrong') {
-      streak = 0; wrong += 1; state = 'wrong'; days = WRONG_BACK;  // 次日必回
+    const rating = resolveRating(result);
+
+    // FSRS 决定下次到期；streak 降级为纯展示指标。
+    // 旧实现 days=IV[streak-1] 且答错把 streak 清零，一次答错就作废此前排期进度。
+    const now = new Date();
+    let card = cardFromJSON(st.fsrs);
+    if (!card) card = createEmptyCard(now);
+    // 复习时间不早于上次复习（防止 elapsed 为负，两侧库对负值处理不同）
+    let reviewAt = now;
+    if (card.last_review instanceof Date && now < card.last_review) reviewAt = card.last_review;
+    const rec = _fsrs.repeat(card, reviewAt)[FSRS_RATING[rating]];
+    const newCard = rec.card;
+    const due = localIso(newCard.due);
+
+    if (result === 'skip') {
+      // 跳过：不进对错统计，但按 Again 排期
+    } else if (rating === 'again') {
+      streak = 0; wrong += 1; state = 'wrong';
     } else {
-      days = SKIP_BACK;                                            // 跳过 3 天后回
+      streak += 1; state = 'correct';
     }
-    const due = isoPlusDays(days);
-    prog[qid] = { state: state, streak: streak, wrong: wrong, due: due, last_seen: nowIso() };
+
+    prog[qid] = {
+      state: state, streak: streak, wrong: wrong, due: due,
+      last_seen: nowIso(), fsrs: cardToJSON(newCard),
+    };
     saveProg();
-    return { ok: true, state: state, streak: streak, wrong: wrong, due: due };
+    return {
+      ok: true, state: state, streak: streak, wrong: wrong, due: due,
+      rating: rating,
+      fsrs_state: FSRS_STATE_NAME[newCard.state] || String(newCard.state),
+      stability: newCard.stability == null ? null : Math.round(newCard.stability * 1e6) / 1e6,
+      difficulty: newCard.difficulty == null ? null : Math.round(newCard.difficulty * 1e6) / 1e6,
+    };
+  }
+
+  /** 排期链路模拟（供 tools/smoke_parity.py 做前后端差分，与 core.schedule_chain 同源）。 */
+  function scheduleChain(sequence) {
+    const base = new Date('2026-01-01T00:00:00Z');
+    let card = createEmptyCard(base);
+    const out = [];
+    for (const item of sequence) {
+      const rating = resolveRating(item[0]);
+      const at = new Date(base.getTime() + item[1] * 86400000);
+      card = _fsrs.repeat(card, at)[FSRS_RATING[rating]].card;
+      out.push({
+        due: card.due.toISOString().slice(0, 16),
+        s: Math.round(card.stability * 1e4) / 1e4,
+        d: Math.round(card.difficulty * 1e4) / 1e4,
+      });
+    }
+    return out;
   }
 
   // ---- 组卷（与 core.py Store.pick 同语义：过滤 + 洗牌/到期排序）----
@@ -627,7 +719,8 @@ export function make(DATA, storage) {
            export_template: exportTemplate,
            checkin: checkin, manual_checkin: manualCheckin,
            export_checkin: exportCheckin, import_checkin: importCheckin,
-           notes_list: notesList, set_note: setNote, question: question };
+           notes_list: notesList, set_note: setNote, question: question,
+           schedule_chain: scheduleChain };
 }
 
 export { INTERVALS, WRONG_BACK, SKIP_BACK, PROG_KEY, NKEY as NOTES_KEY, CKEY as CHECKIN_KEY };

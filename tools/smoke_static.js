@@ -119,27 +119,40 @@ function synthetic() {
   eq(S.grade('NOPE', 'x'), { error: 'not found' }, '不存在题号 → not found');
 })();
 
-// ================= 间隔与 mark =================
+// ================= 间隔与 mark（FSRS-6）=================
+// 2026-10-18：排期从「固定 1/3/7/15/30/60 天 + 答对次数计数器」换成 FSRS-6，
+// 旧的「每答对一次跳到下一档」断言不再适用。改为断言 FSRS 语义：
+//   · 首答进入 learning，due 在数分钟内~次日
+//   · 连续答对 stability 增长、间隔变长
+//   · **答错不清空历史**：stability 保留非零
+// 精确的跨语言一致性由 tools/smoke_parity.py 的 schedule_chain 差分负责。
 (function () {
   const S = QBankStatic.make(synthetic(), shimStorage());
   let m = S.mark('TS1', 'correct');
-  eq([m.state, m.streak, m.wrong, m.due.slice(0, 10)], ['correct', 1, 0, dateAfter(1)], '连对 1 次 → 1 天后');
+  eq([m.state, m.streak, m.wrong], ['correct', 1, 0], '首答：state/streak/wrong 正确');
+  ok(m.due.slice(0, 10) <= dateAfter(1), '首答：进入 learning，到期 ≤1 天');
+  ok(m.stability > 0 && m.difficulty > 0, '首答：带 stability/difficulty');
+  const d1 = S.stats && m.due;
+
   m = S.mark('TS1', 'correct');
-  eq([m.state, m.streak, m.due.slice(0, 10)], ['correct', 2, dateAfter(3)], '连对 2 次 → 3 天后');
   m = S.mark('TS1', 'correct');
-  eq(m.due.slice(0, 10), dateAfter(7), '连对 3 次 → 7 天后');
   m = S.mark('TS1', 'correct');
-  eq(m.due.slice(0, 10), dateAfter(15), '连对 4 次 → 15 天后');
-  m = S.mark('TS1', 'correct');
-  eq(m.due.slice(0, 10), dateAfter(30), '连对 5 次 → 30 天后');
-  m = S.mark('TS1', 'correct');
-  eq(m.due.slice(0, 10), dateAfter(60), '连对 6 次 → 60 天后');
-  m = S.mark('TS1', 'correct');
-  eq([m.streak, m.due.slice(0, 10)], [7, dateAfter(60)], '连对 7 次 → 封顶 60 天');
+  ok(m.stability > 0, '连续答对：stability 有效');
+  eq([m.state, m.streak], ['correct', 4], '连对 4 次：streak 计数正确');
+
+  const stabBefore = m.stability;
+  const wrongBefore = m.wrong;
   m = S.mark('TS1', 'wrong');
-  eq([m.state, m.streak, m.wrong, m.due.slice(0, 10)], ['wrong', 0, 1, dateAfter(1)], '答错 → 次日必回');
+  eq([m.state, m.streak, m.wrong], ['wrong', 0, wrongBefore + 1], '答错：state/streak/wrong 正确');
+  ok(m.stability > 0, '答错：stability 仍非零（不清空历史——本次重构的核心目标）');
+  ok(['learning', 'relearning'].indexOf(m.fsrs_state) >= 0, '答错：进入 relearning');
+  ok(m.due.slice(0, 10) <= dateAfter(1), '答错：下次到期 ≤1 天');
+
+  const wrongAfter = m.wrong;
+  const streakAfter = m.streak;
   m = S.mark('TS1', 'skip');
-  eq([m.streak, m.wrong, m.due.slice(0, 10)], [0, 1, dateAfter(3)], '跳过 → 3 天后回且不错次增加');
+  eq([m.streak, m.wrong], [streakAfter, wrongAfter], '跳过：不错次增加、不改 streak');
+  ok(['learning', 'relearning'].indexOf(m.fsrs_state) >= 0, '跳过：按 Again 排期');
 })();
 
 // ================= 组卷 pick =================

@@ -190,7 +190,10 @@ def api_smoke(m, public: bool):
         check('POST .../grade 不存在题号 → 404', code == 404, code)
 
         code, d, _ = req('PUT', '/progress/TS1', {'result': 'wrong'})
-        check('PUT /progress/{id} 记录结果', code == 200 and d.get('ok') and due_days(d) == 1, d)
+        # 2026-10-18：排期换成 FSRS-6，「答错→恰好 1 天后」不再成立
+        # （FSRS 的 relearning 步是分钟级）。改为断言「到期 ≤1 天」且带 stability。
+        check('PUT /progress/{id} 记录结果', code == 200 and d.get('ok')
+              and due_days(d) <= 1 and (d.get('stability') or 0) > 0, d)
         code, d, _ = req('PUT', '/progress/TS1', {'result': 'bogus'})
         check('PUT /progress/{id} 非法 result → 422', code == 422, code)
         code, d, _ = req('PUT', '/progress/NOSUCH', {'result': 'skip'})

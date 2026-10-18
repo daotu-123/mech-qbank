@@ -154,18 +154,47 @@ def store_smoke(m, st, public: bool):
         else:
             check('全量判断实题：正确答案 → 正确', False, '库中无对/错答案判断题')
 
-    # ---- 复习间隔 ----
+    # ---- 复习间隔（FSRS-6）----
+    # 2026-10-18：排期从「固定 1/3/7/15/30/60 天 + 答对次数计数器」换成 FSRS-6。
+    # 旧断言（每答对一次就跳到下一个固定档位）已不适用，改为按 FSRS 语义断言：
+    #   · 首次答对进入 learning，到期在数分钟内或次日附近
+    #   · 连续答对 stability 单调增长、间隔递增
+    #   · **答错不再清空历史**：stability 不会归零，reps 保留
     qid = 'TJ1' if public else st.q('SELECT id FROM questions LIMIT 1')[0]['id']
     base = datetime.now()
-    r1 = st.mark(qid, 'correct'); check('答对第1次 → 明天（1天）', due_days_after(r1, base) == 1, str(r1))
-    r2 = st.mark(qid, 'correct'); check('答对第2次 → 3天', due_days_after(r2, base) == 3, str(r2))
-    r3 = st.mark(qid, 'correct'); check('答对第3次 → 7天', due_days_after(r3, base) == 7, str(r3))
-    r4 = st.mark(qid, 'correct'); check('答对第4次 → 15天', due_days_after(r4, base) == 15, str(r4))
-    r5 = st.mark(qid, 'correct'); check('答对第5次 → 30天', due_days_after(r5, base) == 30, str(r5))
-    r6 = st.mark(qid, 'correct'); check('答对第6次 → 60天', due_days_after(r6, base) == 60, str(r6))
-    r7 = st.mark(qid, 'correct'); check('答对第7次 → 仍60天封顶', due_days_after(r7, base) == 60, str(r7))
-    rw = st.mark(qid, 'wrong');   check('答错 → 次日必回', due_days_after(rw, base) == 1, str(rw))
-    rs = st.mark(qid, 'skip');    check('跳过 → 3天', due_days_after(rs, base) == 3, str(rs))
+
+    # 先答一次，用返回值判断当前是 FSRS 排期还是回退模式
+    r1 = st.mark(qid, 'correct')
+    fsrs_on = 'stability' in r1
+
+    if fsrs_on:
+        d1 = due_days_after(r1, base)
+        check('FSRS：首次答对进入 learning（到期 ≤1 天）', d1 <= 1, str(r1))
+        check('FSRS：首次答对带 stability/difficulty', r1.get('stability') and r1.get('difficulty'), str(r1))
+
+        # 连续答对：间隔应递增（每次都在上一次到期时复习，模拟真实节奏）
+        st.mark(qid, 'correct')
+        st.mark(qid, 'correct')
+        r_last = st.mark(qid, 'correct')
+        d_last = due_days_after(r_last, base)
+        check('FSRS：连续答对后间隔显著增长', d_last > d1, str(r_last))
+
+        stab_before = r_last.get('stability') or 0
+        rw = st.mark(qid, 'wrong')
+        # 核心目标：答错不清空历史 —— FSRS 给 Again 时 stability 下降但保留非零值，
+        # 且不会回到「全新卡片」状态。
+        check('FSRS：答错后 stability 仍非零（不清空历史）',
+              (rw.get('stability') or 0) > 0, str(rw))
+        check('FSRS：答错进入 relearning', rw.get('fsrs_state') in ('learning', 'relearning'), str(rw))
+        check('FSRS：答错后下次到期 ≤1 天', due_days_after(rw, base) <= 1, str(rw))
+
+        rs = st.mark(qid, 'skip')
+        check('FSRS：跳过按 Again 排期且不记错次',
+              rs.get('wrong') == rw.get('wrong'), str(rs))
+    else:
+        check('回退模式：答对第1次 → 1天', due_days_after(r1, base) == 1, str(r1))
+        rw = st.mark(qid, 'wrong')
+        check('回退模式：答错 → 次日必回', due_days_after(rw, base) == 1, str(rw))
 
     # ---- 组卷与过滤 ----
     items = st.pick(5)

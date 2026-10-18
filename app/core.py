@@ -24,7 +24,7 @@ mech-qbank · 数据层（无 HTTP 依赖，服务端与 API 共用）
 """
 from __future__ import annotations
 import atexit, calendar, json, os, re, sqlite3, sys, threading, traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # 路径：源码运行用仓库目录；PyInstaller 打包后资源在 _MEIPASS（只读、临时解包），
@@ -44,8 +44,55 @@ PORT = int(os.environ.get('QBANK_PORT', '8640'))
 PORT_SCAN = max(1, int(os.environ.get('QBANK_PORT_SCAN', '10')))  # 端口被占用时向后尝试的个数
 INTERVALS = [int(x) for x in os.environ.get('QBANK_INTERVALS', '1,3,7,15,30,60').replace('，', ',').split(',')
              if x.strip().isdigit()] or [1, 3, 7, 15, 30, 60]
-WRONG_BACK = 1   # 答错次日必回
+WRONG_BACK = 1   # 答错次日必回（仅在 FSRS 不可用时作为回退）
 SKIP_BACK = 3    # 跳过 3 天后回
+
+# ---------------------------------------------------------------- FSRS 排期
+# 2026-10-18：把「答对次数计数器」换成 FSRS-6 间隔重复。
+#
+# 旧实现的问题（core.py 原 mark()）：
+#   days = INTERVALS[min(streak,6)-1]，答错 streak 归零 → 下次答对回到 1 天，
+#   此前进度全部清零；无 ease、无四档评分、无遗忘曲线。
+#
+# 新实现：调用 py-fsrs（FSRS-6 官方 Python 实现），前端 static-store.js 用
+# ts-fsrs（官方 JS 实现），两端算法同源。二者在「到期后复习」时输出完全一致；
+# 对「提前复习」（未到期就答）两库处理不同，因此本层把复习时间钳到 max(now, due)，
+# 保证两端输入一致。
+#
+# 评分映射：答对 → Good；答错 → Again；跳过的语义是「不知道」→ Again；
+# 前端四档按钮可显式传 again/hard/good/easy。
+FSRS_RATINGS = ('again', 'hard', 'good', 'easy')
+FSRS_ENABLED_ENV = 'QBANK_FSRS'
+FSRS_ENABLED = os.environ.get(FSRS_ENABLED_ENV, '1').strip() not in ('0', 'false', 'False', 'off')
+
+try:
+    from fsrs import Scheduler as _FsrsScheduler, Card as _FsrsCard, Rating as _FsrsRating
+    _FSRS_OK = True
+except Exception:                                    # pragma: no cover - 依赖缺失时回退旧逻辑
+    _FSRS_OK = False
+    _FsrsScheduler = _FsrsCard = _FsrsRating = None
+
+_FSRS_ENGINE = _FsrsScheduler(enable_fuzzing=False) if _FSRS_OK else None
+_FSRS_RATING_MAP = {
+    'again': _FsrsRating.Again, 'hard': _FsrsRating.Hard,
+    'good': _FsrsRating.Good, 'easy': _FsrsRating.Easy,
+} if _FSRS_OK else {}
+
+
+def fsrs_available() -> bool:
+    return bool(_FSRS_OK and FSRS_ENABLED)
+
+
+def resolve_rating(result: str) -> str:
+    """把旧的 correct/wrong/skip 与新的四档评分统一成 FSRS 评分名。"""
+    r = (result or '').strip().lower()
+    if r in FSRS_RATINGS:
+        return r
+    if r == 'correct':
+        return 'good'
+    if r in ('wrong', 'skip'):
+        return 'again'          # 跳过语义上是「不知道」，与答错同样进重学
+    return 'good'
 # 本机服务只认这些 Host / Origin —— 挡 DNS rebinding（恶意页面把域名重绑到 127.0.0.1 后与目标同源，
 # 浏览器同源策略会放行，届时它能读 /api/progress、/api/notes 并跨站 POST 改写进度/备注）。
 # 将来若要局域网/手机访问，需显式把 IP 加进来，并同时把绑定地址从 127.0.0.1 放开。
@@ -228,6 +275,87 @@ class Store:
                  for c in pub.get('cards', [])])
             self.con.commit()
             self._load_progress_json()
+        # FSRS 卡片状态独立成表：progress 表已有 6 处显式列清单
+        # （mark/export/import/save/DDL/迁移），加列要全改；新表只需 2 处。
+        self._ensure_fsrs_table()
+
+    def _ensure_fsrs_table(self) -> None:
+        self.con.execute('CREATE TABLE IF NOT EXISTS fsrs_state('
+                         'id TEXT PRIMARY KEY, card TEXT, updated TEXT)')
+        self.con.commit()
+
+    # ---- FSRS 排期 ----
+    def schedule_chain(self, sequence, start=None):
+        """按给定序列推进一张全新卡片，返回每步 {due, s, d}。
+
+        纯内存、不落库、不读时钟，供前后端差分测试使用（两侧传同一序列必须同结果）。
+        sequence: [(rating, day_offset)]，rating 可为 again/hard/good/easy 或 correct/wrong/skip。
+        """
+        if not fsrs_available():
+            return None
+        base = start or datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        card = _FsrsCard(due=base)
+        out = []
+        for rating, off in sequence:
+            at = base + timedelta(days=off)
+            card, _ = _FSRS_ENGINE.review_card(
+                card, _FSRS_RATING_MAP[resolve_rating(rating)], review_datetime=at)
+            out.append({
+                'due': card.due.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M'),
+                's': round(card.stability, 4),
+                'd': round(card.difficulty, 4),
+            })
+        return out
+
+    def _fsrs_load(self, qid: str):
+        row = self.con.execute('SELECT card FROM fsrs_state WHERE id=?', (qid,)).fetchone()
+        if not row or not row['card']:
+            return _FsrsCard()
+        try:
+            return _FsrsCard.from_dict(json.loads(row['card']))
+        except Exception:
+            return _FsrsCard()
+
+    def _fsrs_save(self, qid: str, card) -> None:
+        self.con.execute('INSERT OR REPLACE INTO fsrs_state(id,card,updated) VALUES(?,?,?)',
+                         (qid, json.dumps(card.to_dict(), ensure_ascii=False), now_iso()))
+
+    def schedule(self, qid: str, result: str, now=None, dry: bool = False):
+        """用 FSRS-6 计算下一次到期。
+
+        result 接受四档（again/hard/good/easy）或旧语义（correct/wrong/skip）。
+        返回 dict；FSRS 不可用时返回 None，调用方回退到旧的固定间隔。
+        dry=True 时只算不落库（供差分测试使用）。
+        """
+        if not fsrs_available():
+            return None
+        rating = resolve_rating(result)
+        base = now or datetime.now(timezone.utc)
+        card = self._fsrs_load(qid)
+        # 全新卡片：Card() 的默认 due 取的是真实当前时间，会让计算结果不可复现，
+        # 也干扰「钳到到期」逻辑，因此显式用 base 作为初始到期。
+        is_new = card.stability is None and card.last_review is None
+        if is_new:
+            card = _FsrsCard(due=base)
+        # 提前复习（未到期就答）时，不能把复习时间倒推到上次复习之前，
+        # 否则 elapsed 为负、两个官方实现（py-fsrs / ts-fsrs）处理不一致。
+        # 这里只保证「时间不倒退」，复习时间仍取 now，语义正确。
+        review_at = base
+        lr = getattr(card, 'last_review', None)
+        if lr is not None and base < lr:
+            review_at = lr
+        new_card, _log = _FSRS_ENGINE.review_card(
+            card, _FSRS_RATING_MAP[rating], review_datetime=review_at)
+        if not dry:
+            self._fsrs_save(qid, new_card)
+        due_local = new_card.due.astimezone().replace(tzinfo=None)
+        return {
+            'due': due_local.isoformat(timespec='seconds'),
+            'rating': rating,
+            'fsrs_state': new_card.state.name.lower(),
+            'stability': round(new_card.stability, 6) if new_card.stability is not None else None,
+            'difficulty': round(new_card.difficulty, 6) if new_card.difficulty is not None else None,
+        }
 
     # ---- 进度文件（仅公开模式）----
     def _load_progress_json(self) -> None:
@@ -504,21 +632,43 @@ class Store:
             st = dict(rows[0]) if rows else {'state': 'new', 'streak': 0, 'wrong': 0}
             streak, wrong = st.get('streak') or 0, st.get('wrong') or 0
             state = st.get('state') or 'new'
-            if result == 'correct':
-                streak += 1
-                state = 'correct'
-                days = INTERVALS[min(streak, len(INTERVALS)) - 1]   # 1→1天 2→3天 … 6+→60天
-            elif result == 'wrong':
-                streak = 0; wrong += 1; state = 'wrong'; days = WRONG_BACK
+            rating = resolve_rating(result)
+
+            # FSRS 决定下次到期；streak 降级为纯展示指标。
+            # 旧实现 days=INTERVALS[streak-1] 且答错把 streak 清零，导致
+            # 一次答错就把此前的排期进度全部作废——这是本次替换的核心目标。
+            fs = self.schedule(qid, result)
+            if fs:
+                due = fs['due']
+                if result == 'skip':
+                    # 跳过：不进对错统计，但按 Again 排期（语义是「没掌握」）
+                    pass
+                elif rating == 'again':
+                    streak = 0; wrong += 1; state = 'wrong'
+                else:
+                    streak += 1; state = 'correct'
             else:
-                days = SKIP_BACK
-            due = (datetime.now() + timedelta(days=days)).isoformat(timespec='seconds')
+                # 回退路径：FSRS 不可用（缺依赖或显式关闭）时保持旧行为
+                if result == 'correct':
+                    streak += 1
+                    state = 'correct'
+                    days = INTERVALS[min(streak, len(INTERVALS)) - 1]
+                elif result == 'wrong':
+                    streak = 0; wrong += 1; state = 'wrong'; days = WRONG_BACK
+                else:
+                    days = SKIP_BACK
+                due = (datetime.now() + timedelta(days=days)).isoformat(timespec='seconds')
+
             self.con.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
                              ' VALUES(?,?,?,?,?,?)', (qid, state, streak, wrong, due, now_iso()))
             self.con.commit()
         # 落盘移到锁外：磁盘 I/O 不再阻塞并发的答题/查询请求
         self._schedule_progress_save()
-        return {'ok': True, 'state': state, 'streak': streak, 'wrong': wrong, 'due': due}
+        out = {'ok': True, 'state': state, 'streak': streak, 'wrong': wrong, 'due': due}
+        if fs:
+            out.update({'rating': fs['rating'], 'fsrs_state': fs['fsrs_state'],
+                        'stability': fs['stability'], 'difficulty': fs['difficulty']})
+        return out
 
     def export_progress(self) -> dict:
         rows = self.q('SELECT * FROM progress')

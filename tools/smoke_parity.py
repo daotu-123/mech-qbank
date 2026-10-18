@@ -38,6 +38,11 @@ GIVENS = ['A', 'B', 'C', 'D', 'AB', 'ABC', '对', '错', '正确', '错误',
           '分度圆|模数', '模数|分度圆', '分度圆|模数|压力角', '压力角',
           '分度圆 ｜ 模数', '公差', ' 公差。']
 
+# 排期差分的固定序列（两侧传入完全相同的 (rating, 相对天数)）：
+# 覆盖四档评分、一次遗忘重学、以及一次长间隔后的 Easy。
+SCHED_SEQ = [('good', 0), ('good', 0), ('again', 3), ('good', 4),
+             ('hard', 10), ('easy', 30)]
+
 # 合成哨兵题：全库可能没有 answer 含 | 的填空，用它确保两端都走到新分支。
 # SYNTHF2 的答案 '对|错|对' 专门验证「填空分支必须先于判断题分支」——
 # 否则单空答案为「对/错」的挖空题会被 norm_judge 抢走误判。
@@ -92,7 +97,8 @@ def run_js(node: str, questions: list, intervals: list) -> dict:
     tmp = Path(tempfile.mkdtemp(prefix='qbank-parity-'))
     try:
         (tmp / 'in.json').write_text(
-            json.dumps({'questions': questions, 'givens': GIVENS, 'intervals': intervals},
+            json.dumps({'questions': questions, 'givens': GIVENS, 'intervals': intervals,
+                        'sched_seq': SCHED_SEQ},
                        ensure_ascii=False), encoding='utf-8')
         (tmp / 'run.js').write_text(r'''
 var fs = require('fs');
@@ -109,12 +115,11 @@ for (var i = 0; i < d.questions.length; i++) {
                         String(r.answer || '').slice(0, 40),
                         JSON.stringify(r.fill || null)];
   }
-  // 连答对 6 次（streak 1..6）取每次 due，再各答错/跳过一次
-  var due = [];
-  for (var k = 0; k < d.intervals.length; k++) due.push(s.mark(q.id, 'correct').due.slice(0, 10));
-  due.push(s.mark(q.id, 'wrong').due.slice(0, 10));
-  due.push(s.mark(q.id, 'skip').due.slice(0, 10));
-  res._due = due;
+  // 排期：走 static-store 的真实排期器 schedule_chain（与 core.schedule_chain 同序列）。
+  // 2026-10-18 同步改造：此前这里是「连答对 6 次取 due」，而 Python 侧是按固定公式
+  // 重算、根本不调 mark()，于是改排期两端都不红——假守护。
+  var chain = s.schedule_chain ? s.schedule_chain(d.sched_seq) : null;
+  res._due = chain ? chain.map(function (x) { return x.due; }) : null;
   // 题型排序标签（隐藏字段）：两端必须同档，否则组卷顺序会分叉
   var row = s.question(q.id);
   res._qrank = row ? row.qrank : null;
@@ -186,10 +191,13 @@ def main() -> int:
             res[g] = [r.get('correct'), bool(r.get('self')), (r.get('answer') or '')[:40],
                       json.dumps(r.get('fill'), ensure_ascii=False, separators=(',', ':'))]
         base = datetime.now()
-        res['_due'] = [(base + timedelta(days=iv[min(k + 1, len(iv)) - 1])).strftime('%Y-%m-%d')
-                       for k in range(len(iv))]
-        res['_due'].append((base + timedelta(days=server.WRONG_BACK)).strftime('%Y-%m-%d'))
-        res['_due'].append((base + timedelta(days=server.SKIP_BACK)).strftime('%Y-%m-%d'))
+        # 排期：必须调用**真实排期器**。
+        # 2026-10-18 修正：此前这里是「按固定 INTERVALS 公式重算」，
+        # 根本没调用 mark()/schedule()，所以改 core.mark() 内部逻辑它依然绿——
+        # 是假守护（改 FSRS 时会骗人）。现改为调用 core.schedule_chain()。
+        chain = st.schedule_chain(SCHED_SEQ) if hasattr(st, 'schedule_chain') else None
+        res['_due'] = [x['due'] for x in chain] if chain else None
+        res['_sched'] = [(x['s'], x['d']) for x in chain] if chain else None
         res['_qrank'] = server.qtype_rank(q['qtype'])   # 题型排序标签（隐藏）
         py[q['id']] = res
 
@@ -223,7 +231,7 @@ def main() -> int:
     if bad_grade or bad_due or bad_rank:
         print('\n✗ 两端不一致 —— 改 core.py 或 static-store.js 时必须同步另一端')
         return 1
-    print('✓ 两端判分、排期与题型标签完全一致（间隔 %s 天）' % '/'.join(str(x) for x in iv))
+    print('✓ 两端判分、排期（FSRS-6）与题型标签完全一致')
     return 0
 
 
