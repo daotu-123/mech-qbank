@@ -38,7 +38,7 @@ async function jump(qid) {
   const item = r && r.item;
   if (!item) { ElMessage.error('题目已不存在：' + qid); return; }
   startSession([item], '备注 · ' + qid);
-  router.push('/');
+  router.push('/quiz');        // 首页是今日学习台，题卡只渲染在 /quiz
   setTimeout(() => document.querySelector('#quiz-area')?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 50);
 }
 async function remove(qid) {

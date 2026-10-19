@@ -560,6 +560,27 @@ function synthetic() {
   eq(S2.custom_list().map(x => x.id), ['XZ2'], '自定义题：变更已持久化到 localStorage');
 })();
 
+// ================= 源码静态回归（只在浏览器里暴露的问题，先在源码层拦住）=================
+// 为什么需要：视图层没有组件测试，首页从 QuizView 改成 TodayView 后，
+// WrongView / NotesCard 里两处 router.push('/') 静默失效（跳过去看不到题卡），
+// 没有任何自动化测试能拦住。这里用「读源码 + 正则断言」做最廉价的回归防护。
+(function () {
+  const fs = require('fs');
+  const SRC = path.join(__dirname, '..', 'web', 'src');
+  const read = p => fs.readFileSync(path.join(SRC, p), 'utf8');
+  const router = read('router.js');
+  const wrong = read('views/WrongView.vue');
+  const notes = read('components/NotesCard.vue');
+  const review = read('views/ReviewView.vue');
+
+  ok(/path:\s*'\/'[\s\S]{0,40}TodayView/.test(router), 'router：/ 是今日学习台（TodayView）');
+  ok(/path:\s*'\/quiz'/.test(router), 'router：/quiz 是刷题页');
+  ok(!/router\.push\(\s*['"]\/['"]\s*\)/.test(wrong), 'WrongView：起会话后跳 /quiz，不跳已改版的首页');
+  ok(!/router\.push\(\s*['"]\/['"]\s*\)/.test(notes), 'NotesCard：跳到该题后跳 /quiz，不跳首页');
+  ok(/router\.push\(\s*['"]\/quiz['"]\s*\)/.test(review), 'ReviewView：对照组仍跳 /quiz（防止三条写歪）');
+  ok(!/q\.answer/.test(wrong), '错题本不读 q.answer（组卷接口从不下发答案，显示「（待补）」是误导）');
+})();
+
 // ---- 汇总 ----
 console.log('静态模式冒烟（static-store.js）：通过 %d ｜ 失败 %d', pass, fail);
 if (fail) { fails.forEach(f => console.log('  ✗ ' + f)); process.exit(1); }

@@ -17,7 +17,7 @@
           <span v-else class="pill gray">待巩固</span>
         </h4>
         <p>{{ q.stem }}</p>
-        <div class="meta">答案：{{ q.answer || '（待补）' }}</div>
+        <div class="meta">出处：{{ q.sec || q.bank || '—' }}</div>
       </div>
     </div>
     <div v-else class="card empty">错题本是空的 ✓</div>
@@ -42,7 +42,7 @@ async function load() {
 function redo() {
   if (!items.value.length) { ElMessage.error('错题本是空的'); return; }
   startSession(items.value, '错题重练');
-  router.push('/');
+  router.push('/quiz');        // 首页已改为「今日学习台」，跳 / 只会看到学习台，刷题要进 /quiz
 }
 onMounted(load);
 </script>
