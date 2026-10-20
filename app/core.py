@@ -27,12 +27,13 @@ import atexit, calendar, io, json, os, re, sqlite3, sys, threading, traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import storage
-#分层（2026-10-20 后端重构，纯结构调整）：文件读写的唯一出口是 storage 模块。
-# 本文件原有的 6 处 JSON 读写（PROGJSON / CKJSON / NOTESJSON / PUBJSON / DB 探测 / qbank.log）
-# 已全部改走它。注意 storage 是**普通公开名字**，所以 `from core import *` 会把它一并带进
-# api.py 与 server.py —— 那两个文件不需要单独 import。_log_path/_log/_log_exc 是下划线名字，
-# import * 会跳过，api.py/server.py 必须显式导入（server.py:55已补）。
+import repository, storage
+# 分层（2026-10-20 后端重构，纯结构调整，不改判定行为）：
+#   storage    文件读写的唯一出口（notes.json / progress.json / checkin.json / qbank.log）
+#   repository SQL 的唯一出口（加锁 + 执行 + 取行绑在一起，杜绝绕过锁的直连）
+# 注意 storage 与 repository 都是**普通公开名字**，所以 `from core import *` 会把两者
+# 一并带进 api.py 与 server.py —— 那两个文件不需要单独 import。下划线名字
+# （_log/_log_exc/_alert）依然会被 import * 跳过，server.py:55 的显式导入仍然必需。
 
 # 路径：源码运行用仓库目录；PyInstaller 打包后资源在 _MEIPASS（只读、临时解包），
 # 可写数据（进度/自建库）放 exe 同级目录 —— 2026-10-10 打包时补
@@ -246,6 +247,7 @@ class Store:
         if self.mode == 'sqlite':
             self.con = sqlite3.connect(DB, check_same_thread=False)
             self.con.row_factory = sqlite3.Row
+            self.repo = repository.Repository(self.con, self.lock)
         else:
             if not storage.probe(PUBJSON):
                 raise SystemExit('找不到数据：先跑 tools/qbank_build.py 生成 data/qbank.sqlite，'
@@ -256,7 +258,9 @@ class Store:
                 raise SystemExit('data/public/qbank.json 解析失败：%s' % e)
             self.con = sqlite3.connect(':memory:', check_same_thread=False)
             self.con.row_factory = sqlite3.Row
-            self.con.executescript('''
+            # repository 必须在建表之前就绪：public 分支要用它执行 DDL 与批量插入
+            self.repo = repository.Repository(self.con, self.lock)
+            self.repo.executescript('''
               CREATE TABLE questions(id TEXT PRIMARY KEY, bank TEXT, source_class TEXT, section_path TEXT,
                 section TEXT, cat_name TEXT, stem TEXT, qtype TEXT, level INTEGER, options TEXT,
                 answer TEXT, explanation TEXT, source TEXT, note TEXT, meta TEXT);
@@ -265,26 +269,24 @@ class Store:
               CREATE TABLE progress(id TEXT PRIMARY KEY, state TEXT DEFAULT 'new', streak INTEGER DEFAULT 0,
                 wrong INTEGER DEFAULT 0, due TEXT, last_seen TEXT);
             ''')
-            self.con.executemany('INSERT OR REPLACE INTO questions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            self.repo.executemany('INSERT OR REPLACE INTO questions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 [(q['id'], q.get('bank', ''), q.get('source_class', ''), q.get('section_path', ''), '',
                   q.get('cat_name', ''), q['stem'], q.get('qtype', ''), q.get('level'),
                   json.dumps(q.get('options', []), ensure_ascii=False),
                   q.get('answer', ''), q.get('explanation', ''), q.get('source', ''), '', '')
                  for q in pub.get('questions', [])])
-            self.con.executemany('INSERT INTO cards(chapter,topic,name,body,qids,source_class) VALUES(?,?,?,?,?,?)',
+            self.repo.executemany('INSERT INTO cards(chapter,topic,name,body,qids,source_class) VALUES(?,?,?,?,?,?)',
                 [(c.get('chapter', ''), c.get('topic', ''), c.get('name', ''), c.get('body', ''),
                   json.dumps(c.get('qids', []), ensure_ascii=False), c.get('source_class', '通用知识点'))
                  for c in pub.get('cards', [])])
-            self.con.commit()
             self._load_progress_json()
         # FSRS 卡片状态独立成表：progress 表已有 6 处显式列清单
         # （mark/export/import/save/DDL/迁移），加列要全改；新表只需 2 处。
         self._ensure_fsrs_table()
 
     def _ensure_fsrs_table(self) -> None:
-        self.con.execute('CREATE TABLE IF NOT EXISTS fsrs_state('
-                         'id TEXT PRIMARY KEY, card TEXT, updated TEXT)')
-        self.con.commit()
+        self.repo.execute('CREATE TABLE IF NOT EXISTS fsrs_state('
+                          'id TEXT PRIMARY KEY, card TEXT, updated TEXT)')
 
     # ---- FSRS 排期 ----
     def schedule_chain(self, sequence, start=None):
@@ -310,7 +312,7 @@ class Store:
         return out
 
     def _fsrs_load(self, qid: str):
-        row = self.con.execute('SELECT card FROM fsrs_state WHERE id=?', (qid,)).fetchone()
+        row = self.repo.fetchone('SELECT card FROM fsrs_state WHERE id=?', (qid,))
         if not row or not row['card']:
             return _FsrsCard()
         try:
@@ -319,8 +321,11 @@ class Store:
             return _FsrsCard()
 
     def _fsrs_save(self, qid: str, card) -> None:
-        self.con.execute('INSERT OR REPLACE INTO fsrs_state(id,card,updated) VALUES(?,?,?)',
-                         (qid, json.dumps(card.to_dict(), ensure_ascii=False), now_iso()))
+        # 刻意用 no_commit：原实现是裸 con.execute 不提交，靠后续 mark() 里的 x()
+        # 顺带提交。FSRS 属纪律禁区，行为必须逐字保持，故不借 repository.execute
+        # 的自动 commit 顺手「修正」它——那是行为变更，需要先问。
+        self.repo.execute_nowait('INSERT OR REPLACE INTO fsrs_state(id,card,updated) VALUES(?,?,?)',
+                                 (qid, json.dumps(card.to_dict(), ensure_ascii=False), now_iso()))
 
     def schedule(self, qid: str, result: str, now=None, dry: bool = False):
         """用 FSRS-6 计算下一次到期。
@@ -366,12 +371,11 @@ class Store:
         raw = storage.read_json(PROGJSON, default=None)
         if raw:
             try:
-                for pid, v in raw.items():
-                    self.con.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
-                                     ' VALUES(?,?,?,?,?,?)',
-                                     (pid, v.get('state', 'new'), v.get('streak', 0), v.get('wrong', 0),
-                                      v.get('due'), v.get('last_seen')))
-                self.con.commit()
+                self.repo.executemany(
+                    'INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
+                    ' VALUES(?,?,?,?,?,?)',
+                    [(pid, v.get('state', 'new'), v.get('streak', 0), v.get('wrong', 0),
+                      v.get('due'), v.get('last_seen')) for pid, v in raw.items()])
             except Exception:
                 pass  # 内容结构不对不影响启动
 
@@ -379,7 +383,7 @@ class Store:
         if self.mode != 'public':
             return
         try:
-            rows = self.con.execute('SELECT * FROM progress').fetchall()
+            rows = self.repo.fetchall('SELECT * FROM progress')
             ok = storage.write_json(PROGJSON, {
                 r['id']: {k: r[k] for k in ('state', 'streak', 'wrong', 'due', 'last_seen')} for r in rows})
             if not ok:
@@ -411,14 +415,16 @@ class Store:
             self._save_timer.start()
 
     # ---- 基础查询（RLock 保证 mark 的读-改-写原子）----
+    # 唯一允许直连 self.con 的地方：q() / x() 自身。
+    # 下面两个方法的实现已下移到 app/repository.py —— 加锁与执行只此一处，
+    # 其余 15 处原先的 self.con.execute 直连（含 mark 读-改-写那条热路径）
+    # 全部改走 q()/x()，不再各自加锁（2026-10-20 分层第 2 步）。
     def q(self, sql, args=()):
-        with self.lock:
-            return self.con.execute(sql, args).fetchall()
+        return self.repo.fetchall(sql, args)
 
     def x(self, sql, args=()):
-        with self.lock:
-            self.con.execute(sql, args)
-            self.con.commit()
+        self.repo.execute(sql, args)
+        return None            # 原实现返回 None，保持不变（repo.execute 返回 cursor）
 
     # ---- 查询 ----
     def stats(self) -> dict:
@@ -634,7 +640,7 @@ class Store:
     # ---- 进度 ----
     def mark(self, qid: str, result: str) -> dict:
         with self.lock:  # 读-改-写一次锁内完成，避免并发丢更新
-            rows = self.con.execute('SELECT * FROM progress WHERE id=?', (qid,)).fetchall()
+            rows = self.repo.fetchall('SELECT * FROM progress WHERE id=?', (qid,))
             st = dict(rows[0]) if rows else {'state': 'new', 'streak': 0, 'wrong': 0}
             streak, wrong = st.get('streak') or 0, st.get('wrong') or 0
             state = st.get('state') or 'new'
@@ -665,9 +671,8 @@ class Store:
                     days = SKIP_BACK
                 due = (datetime.now() + timedelta(days=days)).isoformat(timespec='seconds')
 
-            self.con.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
-                             ' VALUES(?,?,?,?,?,?)', (qid, state, streak, wrong, due, now_iso()))
-            self.con.commit()
+            self.repo.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
+                          ' VALUES(?,?,?,?,?,?)', (qid, state, streak, wrong, due, now_iso()))
         # 落盘移到锁外：磁盘 I/O 不再阻塞并发的答题/查询请求
         self._schedule_progress_save()
         out = {'ok': True, 'state': state, 'streak': streak, 'wrong': wrong, 'due': due}
@@ -686,13 +691,13 @@ class Store:
             for pid, v in (data or {}).items():
                 if not pid or not isinstance(v, dict):
                     continue
-                self.con.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
+                self.repo.execute_nowait('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
                                  ' VALUES(?,?,?,?,?,?)',
                                  (str(pid), str(v.get('state', 'new')), clamp_int(v.get('streak'), 0, 0, 9999),
                                   clamp_int(v.get('wrong'), 0, 0, 99999),
                                   str(v.get('due') or '') or None, str(v.get('last_seen') or '') or None))
                 n += 1
-            self.con.commit()
+            self.con.commit()   # 原实现就是循环内裸 execute + 末尾统一 commit，刻意保持
         # 导入不频繁，锁外同步写一次即可
         self.save_progress_json()
         return n
@@ -793,9 +798,8 @@ class Store:
             chunk = ids[i:i + CHUNK]
             sql = ('SELECT id, stem, qtype, level, bank FROM questions WHERE id IN (%s)'
                    % ','.join('?' * len(chunk)))
-            with self.lock:             # 一次加锁拿完，而不是每条一次
-                for r in self.con.execute(sql, chunk).fetchall():
-                    meta[r['id']] = r
+            for r in self.repo.fetchall(sql, chunk):   # 一次加锁拿完，而不是每条一次
+                meta[r['id']] = r
         out = []
         for qid, v in notes.items():
             r = meta.get(qid)
@@ -884,17 +888,15 @@ class Store:
             return {'ok': True, 'id': q['id']}
 
     def custom_row(self, qid: str):
-        with self.lock:
-            return self.con.execute(
-                'SELECT id,stem,qtype,level,options,answer,explanation,bank,section_path,cat_name'
-                ' FROM questions WHERE id=? AND source_class=?', (qid, self.CUSTOM_CLASS)).fetchone()
+        return self.repo.fetchone(
+            'SELECT id,stem,qtype,level,options,answer,explanation,bank,section_path,cat_name'
+            ' FROM questions WHERE id=? AND source_class=?', (qid, self.CUSTOM_CLASS))
 
     def custom_list(self, limit: int = 500) -> list:
         # 不返回 answer：列表只用于管理（题号/题型/题干），与 static-store 的 customList 同口径
-        with self.lock:
-            rows = self.con.execute(
-                'SELECT id,stem,qtype,level,bank FROM questions WHERE source_class=?'
-                ' ORDER BY id', (self.CUSTOM_CLASS,)).fetchall()
+        rows = self.repo.fetchall(
+            'SELECT id,stem,qtype,level,bank FROM questions WHERE source_class=?'
+            ' ORDER BY id', (self.CUSTOM_CLASS,))
         return [dict(r) for r in rows[:limit]]
 
     def delete_custom(self, qid: str) -> dict:
