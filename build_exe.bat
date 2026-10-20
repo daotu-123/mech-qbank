@@ -18,6 +18,13 @@ if not exist .venv-build (
   where py >nul 2>nul && (py -3 -m venv .venv-build) || (python -m venv .venv-build)
 )
 .venv-build\Scripts\python.exe -m pip install --upgrade pyinstaller
+REM pymupdf (PyMuPDF) is required by the PDF worker. It is NOT a runtime dep of the
+REM web process - app/pdf_extract.py is imported only inside the worker process -
+REM but the worker lives in THIS exe, so pymupdf must be bundled into it.
+REM Without it the frozen worker fails with ImportError and every PDF parse times out.
+REM --collect-all is required (not just the module): PyMuPDF ships ~105MB of
+REM binary resources (fonts, .pyd) that static analysis does not discover.
+.venv-build\Scripts\python.exe -m pip install "pymupdf==2.0"
 REM uvicorn's dynamic imports (http/ws protocol + lifespan auto-selection) are invisible
 REM to static analysis, so declare them explicitly:
 REM   httptools_impl  - httptools is installed; Config without http= auto-selects it
@@ -28,6 +35,7 @@ REM   lifespan.on     - auto lifespan (used even without lifespan events)
   --hidden-import uvicorn.protocols.http.httptools_impl ^
   --hidden-import uvicorn.protocols.websockets.websockets_impl ^
   --hidden-import uvicorn.lifespan.on ^
+  --collect-all pymupdf ^
   --exclude-module tkinter --exclude-module unittest ^
   --distpath dist --workpath build --specpath build app\api.py
 if not exist dist\mech-qbank.exe (
@@ -39,4 +47,7 @@ echo Done: dist\mech-qbank.exe
 echo Windowed build: double-click opens the browser, no console window.
 echo Quit via the page footer button; logs go to dist\qbank.log
 echo Put your own data\qbank.sqlite next to the exe to use the full library.
+echo PDF worker in this exe: "mech-qbank.exe --pdf-worker IN.pdf OUT.json"
+echo   (frozen cold start measured 2026-10-20: ~7.3s first run / ~6.0s warm,
+echo    vs ~2.9s non-frozen - the onefile bundle must be unpacked to a temp dir.)
 

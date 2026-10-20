@@ -278,6 +278,29 @@ class FrozenDispatchTest(unittest.TestCase):
                          % (proc.returncode, proc.stdout[:200]))
         self.assertTrue(_port_refused(port), '错误参数时竟然开了端口')
 
+    # ---------------------------------------------------------------- f
+    @unittest.skipUnless(HAS_PYMUPDF, '需要 pymupdf')
+    def test_real_frozen_exe_via_client(self):
+        """f. **真 exe** 走 client 的 frozen 分支（frozen=True + python=exe）。
+
+        前面的 a/b 是用 `python app/api.py --pdf-worker` 模拟 frozen；
+        这条是真的跑 dist\\mech-qbank.exe，覆盖 pdf_client.worker_command()
+        的 frozen 分支 + exe 的 argv 分发的**组合**。
+        没有打过包就 skip（不要求每次测试都先打包）。
+        """
+        exe = os.path.join(_ROOT, 'dist', 'mech-qbank.exe')
+        if not os.path.exists(exe):
+            self.skipTest('没有 dist\\mech-qbank.exe（先跑 build_exe.bat）')
+        src = os.path.join(_FIX, '01-chinese-text.pdf')
+        if not os.path.exists(src):
+            self.skipTest('缺少样本 PDF')
+        with open(src, 'rb') as fh:
+            blob = fh.read()
+        import pdf_client
+        r = pdf_client.extract_in_worker(blob, timeout=180, frozen=True, python=exe)
+        self.assertEqual(r.get('status'), 'ok', str(r)[:300])
+        self.assertTrue(r.get('total_chars', 0) > 0)
+
     # ---------------------------------------------------------------- e
     def test_dispatch_precedes_core_import(self):
         """e. 源码结构：分发必须在 `import core` 之前。
