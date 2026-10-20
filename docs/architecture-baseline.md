@@ -312,11 +312,11 @@
 - 两侧都由 `tools/smoke_parity.py` 的"排期比对点"差分（审计日 2533 题 × 同序列，不一致 0）
 - 两份实现还共享一份"手抄的评分映射"（`core.py:86-95` ↔ `static-store.js:31-38`）
 
-### c. `app/server.py` 是否仍在工作？—— ⚠️ 部分确认：**可被加载、测试在跑，但启动路径已崩溃**
+### c. `app/server.py` 是否仍在工作？—— ✅ 确认（**审计时曾崩溃，2026-10-20 已修并补上守护**）
 
 - 仍在仓库、仍被 `tools/smoke_test.py:47-50` 以 spec 方式加载并全量打测（14 个 API 路由，见 §2.2）
 - `start.bat:22-27`：当 `import fastapi` 失败时**回退启动它**——也就是说它是设计上的兜底路径
-- **实测崩溃**（审计当日执行，未改任何代码）：
+- **审计时实测崩溃**：
 
   ```
   $ QBANK_NO_BROWSER=1 python app/server.py
@@ -329,8 +329,15 @@
   ```
 
   根因：`server.py:49` 用 `from core import *` 导入 core，而 Python 的 `import *` **跳过下划线开头的名字**；`_log` 定义在 `core.py:134`（同理 `_log_exc`、`_alert`），因此未被导入。日志改为 `_log()` 是 2026-10-18 为 windowed 打包做的改造（`core.py:122-177`），改造时漏了这个回退文件。
-  之所以测试全绿仍无发现：`smoke_test.py:42-50` 只 `exec_module` 加载模块并直接用 `H` handler 与 `Store`，**从不调用 `main()`**。
-- 附带的第二处不一致：`server.py:13` 的文档字符串仍写"复习间隔：答对按 1/3/7/15/30/60 天"，已被 FSRS-6 取代。
+  之所以当时测试全绿仍无发现：`smoke_test.py:42-50` 只 `exec_module` 加载模块并直接用 `H` handler 与 `Store`，**从不调用 `main()`**。
+
+- **2026-10-20 修复**（提交 `2139501`）：`server.py:55` 补 `from core import _alert, _log, _log_exc`，
+  三个全导（`_alert` 只出现在「Store 初始化失败」与「端口全被占用」两条路径，漏了照样崩）；
+  顺带把 `server.py:13` 那句已被 FSRS-6 取代的文档串改对。
+- **同时补上守护**（提交 `4045cd1`）：`smoke_test.py` 新增 `subprocess_boot_smoke()` ——
+  沙箱根目录里起真子进程 → 轮询端口 → 断言 200 → 杀进程，
+  覆盖 `server.py`（回退路径）、`api.py`（主路径）与端口冲突退出码 1 三条。
+  已用回退法验证：移除修复即 2 条断言变红并打出 NameError 与行号。
 
 ### d. 公开子集的过滤规则写在哪？当前放行多少题？—— ✅ 确认
 
@@ -387,9 +394,9 @@ web/dist/qbank-data.js
 | 6 章"改一行有 379 条断言兜底" | ⚠️ **数字已过时** | 审计日实测合计：103 + 118 + 55 + 232 + parity 65858/2533/2533 比对点；断言总数口径已变 |
 | 报告基准"真实 2334 题 sqlite" | ⚠️ **数字已过时** | 现为 2528 题（报告成文后题库重建过多次） |
 
-**报告未覆盖、审计新增的发现**：`app/server.py` 因 `from core import *` 跳过下划线名字而在启动时 `NameError`（§8-c），且 `smoke_test.py` 从不调用 `main()`，所以六项测试全绿也发现不了。
+**报告未覆盖、审计新增的发现**：`app/server.py` 因 `from core import *` 跳过下划线名字而在启动时 `NameError`（§8-c），且 `smoke_test.py` 从不调用 `main()`，所以六项测试全绿也发现不了。**两条均已于 2026-10-20 修复并补上守护**（`2139501` / `4045cd1`）。
 
-### i. 审计后追加：`smoke_test.py` 的 103 基线并不可靠（数据污染 + 午夜炸弹）
+### i. 审计后追加：`smoke_test.py` 的 103 基线并不可靠（数据污染 + 午夜炸弹）—— ✅ 2026-10-20 已修
 
 这是 §8 核对之外、但结论为「不确认」的一条，按影响面单列。
 
@@ -421,15 +428,21 @@ $ python tools/smoke_test.py
 
 **结论**：`103 通过` 不是一个稳定基线，在**任何**日期跑都可能因真实刷题记录而不同。它必须在 Step 1 之前修掉（复制后清空 `progress` / `fsrs_state`），否则后续每一次重构都在跟一条会漂移的线比较。
 
+**2026-10-20 修复**（提交 `4045cd1`）：新增 `scrub_user_state()`，三个测试文件在复制后
+统一清空 `progress` 与 `fsrs_state`，`questions` / `cards` 一行不动
+（大量断言依赖真实题目：`pick` / `search` / `sections` / 「找一道实题验判分」）。
+子进程沙箱那份库同样清。修完由 `100/3` 回到全绿，且不再随日期变化。
+真实数据核对：跑完测试后 `data/qbank.sqlite` 仍是 `progress` 6 行、`fsrs_state` 0 行，
+mtime 保持 `Oct 18 22:34` 未变。
+
 ---
 
-## 9. 审计时的环境与命令留痕
+## 9. 测试基线与环境留痕
+
+### 9.1 重构前审计时（2026-10-19，`5d207d4`）
 
 ```
-$ git log --oneline -1
-5d207d4 fix(ui): 修首页改版后的两处跳转失效 + 错题本误显答案，并加源码静态回归
-
-$ python tools/smoke_test.py            → 103 通过 / 0 失败
+$ python tools/smoke_test.py            → 103 通过 / 0 失败   ← 后证不可靠，见 §8-i
 $ python tools/smoke_test.py --public   → 118 通过 / 0 失败
 $ node tools/smoke_static.js            → 通过 232 ｜ 失败 0
 $ python tools/smoke_api.py             → 通过 55 ｜ 失败 0
@@ -437,4 +450,22 @@ $ python tools/smoke_parity.py          → 判分 65858 / 排期 2533 / 题型�
 $ python tools/audit_types.py           → exit 0
 ```
 
+> 「103」这个数字后来被证明是**日期相关**的（10-19 蒙对、10-20 实测 100/3），
+> 详见 §8-i。重构起跑请以 9.2 为准。
+
+### 9.2 修复后（2026-10-20，`4045cd1`）—— **以此为重构基线**
+
+```
+$ python tools/smoke_test.py            → 108 通过 / 0 失败   （103+5 为新增子进程启动测试）
+$ python tools/smoke_test.py --public   → 118 通过 / 0 失败
+$ node tools/smoke_static.js            → 通过 232 ｜ 失败 0
+$ python tools/smoke_api.py             → 通过 55 ｜ 失败 0
+$ python tools/smoke_parity.py          → 判分 65858 / 排期 2533 / 题型标签 2533，不一致均为 0
+$ python tools/audit_types.py           → exit 0（2528 题，题型问题 0）
+```
+
 Python 解释器为仓库内 `.venv-build\Scripts\python.exe`（含 fastapi / uvicorn / py-fsrs）。
+
+> **跑测试时的环境坑**：本机若设了 `http_proxy` / `https_proxy`，子进程打向 `127.0.0.1`
+> 的请求会被代理拦成 502，症状伪装成「服务起不来」。`smoke_test.py` 的子进程测试
+> 已在 `spawn()` 里清掉这些变量；`curl` 打本地接口需手动加 `--noproxy '*'`。
