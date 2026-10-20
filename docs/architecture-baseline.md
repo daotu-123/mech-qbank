@@ -174,7 +174,8 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 
                         ┌──────────────────────────────────────────┐
                         │  app/server.py  标准库 http.server router │  ← 零依赖回退路径
-                        │  同一份 service.py + core.py，路由是 if 链  │
+                        │  同一份 service.py + core.py + errors.py   │
+                        │  路由是 if 链                              │
                         └──────────────────────────────────────────┘
 
    web/（Vue 3 + Element Plus + Vite）
@@ -197,6 +198,7 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 | `app/api.py` | `app/service.py`、`app/core.py`、fastapi/uvicorn | 无 |
 | `app/server.py` | `app/service.py`、`app/core.py`（`import core` + `from core import *`） | 无 |
 | `app/service.py` | **仅标准库**（不 import core —— store 由调用方传入） | 无 |
+| `app/errors.py` | **仅标准库**（两套服务端共用的错误格式与 request_id） | 无 |
 | `app/core.py` | `app/repository.py`、`app/storage.py`、仅标准库（可选 `py-fsrs`） | 不知道 HTTP 存在 |
 | `app/repository.py` | 仅标准库（连接与锁由调用方传入） | 无 |
 | `app/storage.py` | 仅标准库（路径由调用方传入） | 无 |
@@ -283,6 +285,59 @@ W3 鉴权占位中间件 `api.py:70-84`（`AUTH_ENABLED=False` 当前不生效�
 | GET | `/static/*` | `server.py:117` | 由 StaticFiles 提供 |
 
 **缺失**：`/api/v1/import_questions` 与 `/api/v1/custom*` 一族在 `server.py` 中**完全不存在**，即 PDF 摘录编辑器依赖的自定义题链路只支持在线（FastAPI）模式。
+
+---
+
+### 2.3 统一错误格式与健康检查（2026-10-20 第3 部分新增）
+
+**错误响应**（两套服务端同结构，唯一真源 `app/errors.py`）：
+
+```json
+{"error": {"code": "not_found", "message": "not found", "request_id": "6ad6e9e3-d7043d"}}
+```
+
+`code` 是**稳定英文标识**，前端靠它分支，**不要匹配 message**：
+
+| code | HTTP | 触发场景 |
+|---|---|---|
+| `invalid_param` | 400 / 422 | 入参校验失败（FastAPI 的 RequestValidationError 走 422） |
+| `not_found` | 404 | 题目 / 路由不存在 |
+| `unauthorized` | 401 | W3 鉴权（**尚未实现**） |
+| `forbidden` | 403 | Host/Origin 白名单不通过 |
+| `internal_error` | 500 / 503 | 未捕获异常；`/health/ready` 数据层不可用时是 503 |
+| `payload_too_large` | 413 | 请求体超10 MB |
+| `unsupported_type` | 415 | Content-Type 不支持 |
+
+**request_id 三处一致**：响应体 / `X-Request-Id` 头 / 日志行。这是把用户看到的响应
+与服务端日志对上的唯一线索，公网化后排障全靠它。
+
+**健康检查**（在 `/api/v1` **之外**，两套服务端都有）：
+
+| 端点 | 行为 | 数据层不可用时 |
+|---|---|---|
+| `GET /health/live` | 只表示进程活着，**刻意不查数据库** | 仍 200 |
+| `GET /health/ready` | **真的读一次**（`SELECT 1`，不跑 `stats()` 这类重查询） | **503** |
+
+> `live` 不查数据库是有意的：数据层出问题该由 `ready` 报出来，
+> 重启解决不了磁盘/权限问题，只会掩盖它。
+
+**结构化日志**（走 `storage` 层，不新开文件句柄）：
+
+```
+ts=2026-10-20T12:11:15 rid=6ad6e9e3-130cf0 method=GET path=/api/v1/stats status=200 ms=6.57
+```
+
+脱敏：`errors.SENSITIVE_KEYS` 覆盖 `authorization`/`cookie`/`token`/`password`/`secret`/
+`api_key` 以及 `answer`/`given`/`note`/`explanation`、`progress`/`state`/`streak`/`wrong`/
+`due`/`last_seen`，命中键名一律替换 `***`。主要手段仍是**根本不把敏感值传进日志**。
+
+**⚠️ 两个框架行为踩坑记录**（都在 app/api.py 注释里）：
+
+1. **异常处理器拿不到 contextvar**。Starlette 的异常处理跑在 `ExceptionMiddleware` 里，
+   **不在 `BaseHTTPMiddleware` 的 contextvar 作用域内**。request_id 必须**同时**写
+   `request.state`（给异常处理器）与 contextvar（给 service 层与日志）。
+2. **中间件后注册先执行**（见§2 传输层规则）。`request_context` 要最外层
+   （覆盖被 guard 拒绝的请求），所以必须**写在 auth/guard 之后**。
 
 ---
 
