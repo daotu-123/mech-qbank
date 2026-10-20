@@ -651,7 +651,7 @@ def main() -> int:
     pub_export = [{k: q[k] for k in ('id', 'bank', 'section_path', 'cat_name', 'stem', 'qtype', 'level',
                                      'options', 'answer', 'explanation', 'source_class')} for q in pub_q]
     (PUB / 'qbank.json').write_text(json.dumps({
-        'schema': 1, 'license': 'CC-BY-SA-4.0 (content) / MIT (code)',
+        'schema': 1, 'license': 'CC-BY-SA-4.0 (content) / AGPL-3.0 (code)',
         'questions': pub_export,
         'cards': cards}, ensure_ascii=False, indent=1), encoding='utf-8')
     con.close()

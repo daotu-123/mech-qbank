@@ -3,7 +3,7 @@
 本地优先的**机械 / 非标自动化刷题工具**：题库浏览、随机刷题、艾宾浩斯复习、错题本、知识点卡片、学习打卡。
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT%20%2B%20CC--BY--SA--4.0-green)](#数据来源与许可重要)
+[![License](https://img.shields.io/badge/license-AGPL--3.0%20%2B%20CC--BY--SA--4.0-green)](#数据来源与许可重要)
 
 | 选择题：ABCD 按钮 | 判断题：✅❌ 按钮 | 学习打卡 | 题目备注 |
 |---|---|---|---|
@@ -65,8 +65,17 @@ cd web && npm install && npm run build && cd ..
 
 ## 数据来源与许可（重要）
 
-- **代码**：MIT（见 `LICENSE`）
+- **代码**：AGPL-3.0（见 `LICENSE`）
 - **内容**（题库文本、知识点卡片）：CC-BY-SA-4.0（见 `LICENSE-CONTENT`）
+- **为什么代码是 AGPL 而不是 MIT**：本项目规划中的 PDF 摘录功能需要链接
+  [PyMuPDF](https://pymupdf.readthedocs.io/)（AGPL-3.0）。AGPL 是强 copyleft，
+  与 MIT 不兼容——链接它的衍生作品整体必须以 AGPL-3.0 发布，所以「代码保留 MIT、
+  只在内部用 PyMuPDF」在法律上不成立。许可证因此**提前**改为 AGPL-3.0
+  （2026-10-20，先改许可证再写代码，避免先写后返工）。若你不需要 PDF 功能，
+  可移除 PDF 解析模块（将来的 `app/pdf_*.py`）后按 MIT 使用其余部分。
+- **AGPL 第 13 条的影响**：若你把本项目部署成公网服务，使用者有权获取完整源码。
+  本仓库已公开即满足该义务。**但若你想把 `dist/mech-qbank.exe` 作为闭源产品分发，
+  AGPL 不允许**——那样的场景需要向 Artifex 购买 PyMuPDF 商业授权。
 - 本仓库**只收录作者自出的题目与通用机械知识点**。任何**公司真题、培训机构套卷、第三方网站面经**均不在收录范围内，构建脚本会按来源分级自动拦截（见 `tools/qbank_build.py` 的 `classify()` 与 `clean()`）。
 - 公开题库的选择题来自 `data/selfauthored/questions.json`（**原创自研题**，190 道），由作者依据自编知识点卡片改写，题目与选项均为原创。它随仓库提交、可直接参与组卷与复习，也是公开版唯一的选择题来源。
 
@@ -108,7 +117,7 @@ mech-qbank/
 ```jsonc
 {
   "schema": 1,
-  "license": "CC-BY-SA-4.0 (content) / MIT (code)",
+  "license": "CC-BY-SA-4.0 (content) / AGPL-3.0 (code)",
   "questions": [{
     "id": "P0001",              // 题号：Q#### 主库 / P|E|C|M|G#### 学习库
     "bank": "学习库/Python",
