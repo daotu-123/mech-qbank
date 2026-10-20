@@ -17,12 +17,15 @@ mech-qbank · PDF 抽取器测试（M3 第 1 步）
 - 六类样本（tests/fixtures/pdf/）：01 中文 / 02 双栏 / 03 表格 / 04 扫描件 /
   05 加密 / 06 损坏 —— 逐样本断言 status 与关键字段
 - 三条边界（**本文件现场造，不入库**）：空字节 / 非 PDF 字节 / 只保留 5% 的截断件
-- 两条回归：页码众数偏移校正；内容流交错的双栏（记录已知代价）
+- 三条回归：
+  · 500 页单栏 → 不能被误判成双栏（统一走 words 后新引入的风险）
+  · 内容流交错的双栏 → 栏序必须正确（左栏整段在前、右栏整段在后）
+  · 页码众数偏移校正
 
 ## 不覆盖（实现时必须补）
 --------------------------------------------------------------------------
 - 真乱码样本、图文混排样本（方案附节列出的未验证项）
-- 英文 PDF（中文按行切词，words 数与英文差 10–20 倍）
+- 英文 PDF（中文按行切词，words 数与英文差 10–50 倍）
 """
 from __future__ import annotations
 
@@ -78,7 +81,7 @@ class TestSixFixtures(unittest.TestCase):
     def test_02_two_column(self):
         r = pdf_extract.extract(_blob('02-two-column.pdf'))
         self.assertEqual(r.status, 'ok')
-        # 分层策略：blocks 粗筛判出多栏 → 升级 words → 栏数 2
+        # 统一走 words 路径，栏数由词级坐标判定
         self.assertEqual(r.columns_detected, 2)
         self.assertEqual(r.pages[0]['columns'], 2)
         # 栏序必须是「先左栏整段、再右栏整段」，不能左右逐行交错
@@ -184,11 +187,61 @@ class TestPageLabel(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_PYMUPDF, '需要 pymupdf（跑在 pdfprobe 解释器上）')
-class TestRegression(unittest.TestCase):
-    """回归：内容流交错的双栏。"""
+class TestSingleColumn(unittest.TestCase):
+    """单栏文档不能被误判成双栏。
+
+    统一走 words 之后，单栏页里的**短行**（比如只剩两个字的一行）或
+    **居中标题**可能被当成「跨中线的栏间空隙」，从而把整页误判成双栏。
+    这是统一路径新引入的风险，必须锁住。
+    """
 
     @staticmethod
-    def _make_interleaved():
+    def _make_single_column(pages=500):
+        """500 页单栏中文，含**右对齐的行内编号**（教材常见排版）。
+
+        右对齐编号是关键：它与左侧正文之间有一个很大的空隙，而且这个空隙
+        **跨越页宽中线**——正是「栏间空隙」的特征。若 gutter 判据只看
+        「有没有宽空隙」而不看「左右两侧段数是否都够」，这一页就会被误判成双栏。
+        所以样本里必须有它，测试才压得住真实风险。
+        """
+        doc = pymupdf.open()
+        body = ('机械设计通常分为方案设计、结构设计与工艺设计三个阶段。'
+                '方案设计决定功能原理与总体布置，结构设计确定零件形状、尺寸与材料，'
+                '工艺设计则解决零件的可制造性与可装配性。三阶段反复迭代，直至满足全部约束。')
+        for i in range(pages):
+            pg = doc.new_page(width=595, height=842)
+            pg.insert_textbox(pymupdf.Rect(48, 50, 547, 700),
+                              '第 %d 页　%s\n%s' % (i + 1, body, body),
+                              fontname='china-s', fontsize=10, lineheight=1.6)
+            # 右对齐行内编号：与左侧正文之间留下大空隙，且跨越页宽中线
+            pg.insert_textbox(pymupdf.Rect(48, 710, 200, 735),
+                              '（续）', fontname='china-s', fontsize=9)
+            pg.insert_textbox(pymupdf.Rect(500, 710, 547, 735),
+                              '%d' % (i + 1), fontname='china-s', fontsize=9)
+            pg.insert_textbox(pymupdf.Rect(48, 790, 547, 815), '- %d -' % (i + 1),
+                              fontname='china-s', fontsize=9, align=1)
+        blob = doc.tobytes()
+        doc.close()
+        return blob
+
+    def test_500_page_single_column_is_not_two_column(self):
+        r = pdf_extract.extract(self._make_single_column(500))
+        self.assertEqual(r.status, 'ok')
+        self.assertEqual(r.page_count, 500)
+        # 文档级与逐页都必须是 1 栏
+        self.assertEqual(r.columns_detected, 1)
+        self.assertEqual(sorted(set(p['columns'] for p in r.pages)), [1])
+        # 页脚页码仍要正确抽取（单栏判定的副产品，顺带锁住）
+        self.assertEqual(r.pages[0]['printed_label'], 1)
+        self.assertEqual(r.pages[499]['printed_label'], 500)
+
+
+@unittest.skipUnless(HAS_PYMUPDF, '需要 pymupdf（跑在 pdfprobe 解释器上）')
+class TestRegression(unittest.TestCase):
+    """回归：内容流交错的双栏——栏序必须正确。"""
+
+    @staticmethod
+    def _make_interleaved(rows=30):
         """左右栏共用同一 y、且在内容流里逐行交错写。
 
         这类 PDF 上**朴素 get_text() 会完全串行**（实测右栏首行在偏移 11、
@@ -197,7 +250,7 @@ class TestRegression(unittest.TestCase):
         doc = pymupdf.open()
         page = doc.new_page(width=595, height=842)
         y = 60.0
-        for i in range(30):
+        for i in range(rows):
             page.insert_textbox(pymupdf.Rect(48, y, 290, y + 20),
                                 '左栏第%02d行数据记录' % i, fontname='china-s', fontsize=9)
             page.insert_textbox(pymupdf.Rect(305, y, 547, y + 20),
@@ -207,20 +260,28 @@ class TestRegression(unittest.TestCase):
         doc.close()
         return blob
 
-    def test_interleaved_keeps_all_content(self):
-        """**已知代价**：分层的 blocks 粗筛在这种 PDF 上会漏判（块被内容流合并），
-        于是走 blocks 路径，栏序是交错的（最坏等于朴素行为，不会更差）。
+    def test_interleaved_column_order(self):
+        """交错内容流下，栏序必须正确：左栏整段在前、右栏整段在后。
 
-        这里断言的是**不丢内容**——30 行左右栏文字都要在——而不是栏序正确。
-        栏序正确需要取消分层（全量 words），实测额外代价仅 +0.9MB / +0.04s，
-        见 docs/pdf-ingest-plan.md §1.11。
+        不能是「左00 右00 左01 右01」这种逐行交错。
         """
         r = pdf_extract.extract(self._make_interleaved())
         self.assertEqual(r.status, 'ok')
-        text = r.pages[0]['text']
-        for i in range(30):
-            self.assertIn('左栏第%02d行数据记录' % i, text)
-            self.assertIn('右栏第%02d行校核说明' % i, text)
+        self.assertEqual(r.columns_detected, 2)
+        lines = r.pages[0]['text'].splitlines()
+
+        left_at = [i for i, l in enumerate(lines) if '左栏第' in l]
+        right_at = [i for i, l in enumerate(lines) if '右栏第' in l]
+        self.assertEqual(len(left_at), 30)
+        self.assertEqual(len(right_at), 30)
+        # 左栏所有行都在右栏所有行之前
+        self.assertLess(max(left_at), min(right_at))
+        # 且栏内顺序不乱
+        self.assertEqual(left_at, sorted(left_at))
+        self.assertEqual(right_at, sorted(right_at))
+        # 首行来自左栏、末行来自右栏
+        self.assertIn('左栏第00行', lines[0])
+        self.assertIn('右栏第29行', lines[-1])
 
     def test_pure_function(self):
         """纯函数：同一输入两次调用结果一致，没有副作用。"""

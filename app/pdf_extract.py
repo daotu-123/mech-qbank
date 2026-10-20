@@ -46,22 +46,24 @@ import（方案 docs/pdf-ingest-plan.md 【J】）。分包方案留到 worker �
 「损失比例 → 结果」依赖截断位置与文件内部对象布局，不可复现，不能当规格。
 详见 tests/fixtures/pdf/README.md 与方案 §1.4。
 
-## 分栏策略（分层，见方案【C】）
+## 分栏与文本抽取：**统一走 words，只有一条路径**
 --------------------------------------------------------------------------
-先用 `get_text("blocks")` 粗筛（几何判据：有没有块明确分居页面两侧），
-只有可疑页才升级到 `get_text("words")` 做「行聚类 → 行内切段 → 段归栏」。
+所有页一律用 `get_text("words")` 做「行聚类 → 行内切段 → 段归栏」，
+判出单栏/双栏，输出「先左栏整段、再右栏整段」。
 
-实测依据（方案 §1.11）：500 页中文文本样本上，仅 blocks 132.8 MB / 全 words
-132.7 MB / 分层 133.7 MB——**差 0.9 MB**。中文没有空格，PyMuPDF 按「行」切词，
-500 页只有 5500 个 words。**所以分层的理由是「路径更短、为英文 PDF 留余量」，
-不是「省内存」**（后者在本项目被实测否掉）。
+**为什么取消「blocks 粗筛 + 可疑页才升级 words」的分层**（owner 2026-10-20 决定）：
+- 分层的实测收益只有 +0.9 MB / +0.04 s（500 页中文，见方案 §1.11），
+  换来的是一个**确定的正确性缺陷**：内容流左右逐行交错的 PDF 上，
+  blocks 会被内容流合并、粗筛漏判，栏序退化成交错。
+- 少一条分支就少一类 bug。双栏恰恰是最容易出错的地方，
+  同一份逻辑不该有两套路径。
+- **英文 PDF 的 words 数比中文多 10–50 倍，而英文双栏远比中文常见**——
+  分层在英文场景下更容易误走 blocks 路径，正好踩在缺陷上。
+
+所以 `get_text("blocks")` **不再用于抽取**，只用于表格识别（数矢量网格线）。
 
 ## 表格（只保行不保列，见方案【D】）
 --------------------------------------------------------------------------
-**必须用 blocks 读**。实测 `get_text()` 会把表格拆成散列
-（`'Q235B'` `'7.85'` `'212'` `'235'` 各占一行，行关系全丢），
-blocks 按 y 聚合才能保住「一行一条记录」。
-
 结构化（`find_tables`）首版不做——实测 500 页要 +100.48 s / +368 MB。
 表格页只打 `table_pages` 标记，交给 UI 提示「未结构化，建议对照原表核对」。
 
@@ -86,9 +88,6 @@ IMAGE_COVERAGE_NO_TEXT = 0.5
 TABLE_MIN_HLINES = 2
 TABLE_MIN_VLINES = 2
 
-# 【C】：多栏粗筛时，一侧至少要有这么多个块才认它是一栏。
-MIN_BLOCKS_PER_SIDE = 2
-
 # 【E】：页码候选里，至少要有这么多页命中，且偏移一致率达标，才采纳 printed_label。
 MIN_LABEL_PAGES = 2
 MIN_LABEL_AGREEMENT = 0.8
@@ -100,6 +99,11 @@ MIN_LABEL_AGREEMENT = 0.8
 # 取 1.2×字高（≈16pt）能干净分开 11pt 与 33pt。
 GAP_HEIGHT_FACTOR = 1.2
 GAP_MIN_PT = 6.0
+
+# 【C】：判「真的是两栏」时，每一栏至少要占全页字符数的这个比例。
+# 用字符数而不是段数——单栏文档的右对齐行内编号会造出「零星几段」，
+# 段数占比刚过线就把整页误判成双栏（实测复现）。字符数才是「成片内容」。
+MIN_COLUMN_CHAR_RATIO = 0.15
 
 # 页脚/页眉里的页码格式。严格匹配，避免把「第 3 章」这类正文误当成页码。
 _LABEL_PATTERNS = (
@@ -236,54 +240,20 @@ def _grid_lines(page) -> tuple:
     return h, v
 
 
-def _looks_multicolumn(blocks, width) -> bool:
-    """粗筛：这一页有没有可能分栏。
-
-    判据是几何而非数值：必须有 >=2 个块**整体**在页面中线左侧，
-    且 >=2 个块**整体**在右侧。块被内容流合并的 PDF 会判不出（漏判），
-    此时退回单栏输出——最坏等于现状，不会更差。
-
-    实测：01 单栏 False、02 双栏 True、03 表格 False（左半块 0）、
-    04 扫描件 False（无块）、05 加密 False。
-    """
-    tb = [b for b in blocks if b[6] == 0 and b[4].strip()]
-    if len(tb) < MIN_BLOCKS_PER_SIDE * 2:
-        return False
-    mid = width * 0.5
-    left = [b for b in tb if b[2] < mid]
-    right = [b for b in tb if b[0] > mid]
-    return len(left) >= MIN_BLOCKS_PER_SIDE and len(right) >= MIN_BLOCKS_PER_SIDE
-
-
 # ------------------------------------------------------------------ 文本抽取
-def _text_by_blocks(page, blocks) -> str:
-    """blocks 路径：按 y 聚成行，块内换行折成空格。
-
-    块内换行必须折掉——表格里一个块是「一行记录」，块内 \\n 是「同一个单元格里
-    的换行」，不折的话一行记录会被拆成几行，行关系又丢了（这正是 get_text()
-    的毛病）。折成空格后 03-table 的输出是：
-        材料 密度 g/cm 弹性模量 GPa 屈服强度 MPa 典型用途
-        Q235B 7.85 212 235 机架、转鼓、焊缝结
-
-    每行后面都带 \\n（含最后一行）：这样 chars 口径与 PyMuPDF 的 get_text() 一致
-    （01 样本 653 字符，两者相等），下游拼接也不用再补分隔符。
-    """
-    ordered = sorted(blocks, key=lambda b: (round(b[1], 1), b[0]))
-    lines = [b[4].strip().replace('\n', ' ') for b in ordered if b[4].strip()]
-    if not lines:
-        return ''
-    return '\n'.join(lines) + '\n'
-
-
 def _text_by_words(page) -> tuple:
-    """words 路径：行聚类 → 行内切段 → 段归栏 → 先左后右、栏内自上而下。
+    """**唯一**的文本抽取路径：行聚类 → 行内切段 → 段归栏 → 先左后右、栏内自上而下。
 
     返回 (文本, 栏数)。
 
-    必要性：朴素 get_text() 在「内容流左右逐行交错」的 PDF 上会**完全串行**
-    （实测右栏首行在偏移 11、左栏末行在 638）。words 级按坐标重排才正确。
+    为什么必须到词级：朴素 get_text() 在「内容流左右逐行交错」的 PDF 上会
+    **完全串行**（实测右栏首行在偏移 11、左栏末行在 638）。按坐标重排才正确。
 
-    单栏判定：gutter 必须落在页宽 30%–70%，且左右两侧段数各不少于全页 20%，
+    表格也走这条路径：**视觉行就是表格行**，所以「一条记录一行」天然成立
+    （03-table 实测输出「Q235B 7.85 212 235 机架、转鼓、焊缝结」一行），
+    不需要为表格单开一条 blocks 分支。
+
+    单栏判定：栏间空隙必须**跨越页宽中线**，且左右两侧段数各不少于全页 20%，
     否则按单栏输出（避免把正常单栏的段间距误当成栏间空隙）。
     """
     words = page.get_text('words')
@@ -343,14 +313,7 @@ def _text_by_words(page) -> tuple:
         gx = crosses[len(crosses) // 2] if len(crosses) % 2 else \
             (crosses[len(crosses) // 2 - 1] + crosses[len(crosses) // 2]) / 2.0
         if width * 0.2 <= gx <= width * 0.8:
-            counts = {0: 0, 1: 0}
-            for r in rows:
-                for s in r['segs']:
-                    cx = (min(w[0] for w in s) + max(w[2] for w in s)) / 2
-                    counts[0 if cx < gx else 1] += 1
-            total = counts[0] + counts[1]
-            if total and counts[0] >= total * 0.2 and counts[1] >= total * 0.2:
-                gutter = gx
+            gutter = gx
 
     if gutter is None:
         lines = [' '.join(w[4] for w in sorted(r['ws'], key=lambda w: w[0])) for r in rows]
@@ -362,6 +325,27 @@ def _text_by_words(page) -> tuple:
         for s in r['segs']:
             cx = (min(w[0] for w in s) + max(w[2] for w in s)) / 2
             (left if cx < gutter else right).append(s)
+
+    # 5) 校验这真的是「两栏」，而不只是「有个跨越中线的空隙」。
+    #
+    # 判据用**字符数占比**，不用段数占比。实测教训：单栏文档里的
+    # **右对齐行内编号**（教材常见排版）与左侧正文之间有个大空隙，
+    # 而且这个空隙**跨越页宽中线**——和真正的栏间空隙特征一样。
+    # 用段数占比判会被骗过去：单栏页里右段是「零星几个」（每页 1–2 段），
+    # 占全页段数 28.6%，刚过 20% 的线 → 整页被误判成双栏（实测复现）。
+    #
+    # 栏是「成片的内容」，不是「零星几个词」。所以看字符数：
+    #   真双栏 → 两边字数相当（02 样本 58%，交错样本 50%）
+    #   单栏+右对齐编号 → 右侧只有一两个字符，占比 < 1%
+    left_chars = sum(len(w[4]) for seg in left for w in seg)
+    right_chars = sum(len(w[4]) for seg in right for w in seg)
+    total_chars = left_chars + right_chars
+    if not total_chars or \
+            left_chars < total_chars * MIN_COLUMN_CHAR_RATIO or \
+            right_chars < total_chars * MIN_COLUMN_CHAR_RATIO:
+        # 不是两栏 → 按单栏输出（保留行聚类结果，不动内容）
+        lines = [' '.join(w[4] for w in sorted(r['ws'], key=lambda w: w[0])) for r in rows]
+        return ('\n'.join(lines) + '\n') if lines else '', 1
 
     def render(segs):
         return '\n'.join(' '.join(w[4] for w in sorted(s, key=lambda w: w[0])) for s in segs)
@@ -487,12 +471,9 @@ def _extract_open(doc) -> ExtractResult:
 
     for index in range(doc.page_count):
         page = doc[index]
-        blocks = [b for b in page.get_text('blocks') if b[6] == 0 and b[4].strip()]
 
-        if _looks_multicolumn(blocks, page.rect.width):
-            text, cols = _text_by_words(page)
-        else:
-            text, cols = _text_by_blocks(page, blocks), 1
+        # 唯一路径：所有页一律走 words 级（不再有 blocks 粗筛分支）。
+        text, cols = _text_by_words(page)
         if cols > columns_detected:
             columns_detected = cols
 
