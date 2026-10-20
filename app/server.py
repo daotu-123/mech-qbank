@@ -10,7 +10,7 @@ mech-qbank · 服务端（标准库 http.server 版，零第三方依赖）
 
 设计约定
   · 不做 LLM 批改：选择题/判断题本地自动判分；问答/计算类返回 correct=null，由用户自评
-  · 复习间隔：答对按 1/3/7/15/30/60 天（QBANK_INTERVALS 可覆盖）；答错次日必回；跳过 3 天后回
+  · 复习间隔：FSRS-6 排期（core.py 的 py-fsrs，fsrs_state 表）；旧固定档位仅作回退
   · 只读题库，进度写进 progress 表（公开模式写 progress.json）
   · 安全：只监听 127.0.0.1，且 Host/Origin 必须在 ALLOWED_HOSTS 白名单内（挡 DNS rebinding）
   · 打包：PyInstaller --windowed（无终端窗口），日志写 exe 同级 qbank.log；
@@ -48,6 +48,11 @@ from urllib.parse import urlparse, parse_qs
 import core                                          # 数据层单例（STORE/SRV/路径常量都在它上面）
 from core import *                                   # noqa: F401,F403 数据层与常量
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
+# 关键：上面的 `import *` **会跳过下划线开头的名字**，而本文件用到 _log/_log_exc/_alert，
+# 不显式导入就会在 main() 里抛 NameError（2026-10-20 实测：server.py:209 _log 未定义直接退出 1）。
+# 三个都要导：_alert 只出现在「启动失败」与「端口全被占用」两条路径上，漏了它们照样崩。
+# app/api.py:31 已是同样的写法，两边保持一致。
+from core import _alert, _log, _log_exc              # noqa: F401
 
 
 def _n_arg(q: dict, default: int = 10) -> int:
