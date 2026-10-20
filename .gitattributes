@@ -1,0 +1,5 @@
+# PDF 验收样本必须按二进制处理。
+# 本机 core.autocrlf=true，而 06-corrupt.pdf 是截断文件、头部不含 NUL 字节，
+# git 会把它误判成文本，clone 时 checkout 做 LF->CRLF 转换会改写字节、毁掉样本。
+# 2026-10-20 实测：不加这行，git diff --numstat 对它输出文本行数而非 "-"。
+tests/fixtures/pdf/*.pdf binary
