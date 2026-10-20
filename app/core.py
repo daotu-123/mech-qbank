@@ -23,9 +23,16 @@ mech-qbank · 数据层（无 HTTP 依赖，服务端与 API 共用）
     并追加写 exe 同级 qbank.log；开发/测试模式仍是裸 print
 """
 from __future__ import annotations
-import atexit, calendar, json, os, re, sqlite3, sys, threading, traceback
+import atexit, calendar, io, json, os, re, sqlite3, sys, threading, traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import storage
+#分层（2026-10-20 后端重构，纯结构调整）：文件读写的唯一出口是 storage 模块。
+# 本文件原有的 6 处 JSON 读写（PROGJSON / CKJSON / NOTESJSON / PUBJSON / DB 探测 / qbank.log）
+# 已全部改走它。注意 storage 是**普通公开名字**，所以 `from core import *` 会把它一并带进
+# api.py 与 server.py —— 那两个文件不需要单独 import。_log_path/_log/_log_exc 是下划线名字，
+# import * 会跳过，api.py/server.py 必须显式导入（server.py:55已补）。
 
 # 路径：源码运行用仓库目录；PyInstaller 打包后资源在 _MEIPASS（只读、临时解包），
 # 可写数据（进度/自建库）放 exe 同级目录 —— 2026-10-10 打包时补
@@ -142,11 +149,7 @@ def _log(msg: str) -> None:
             print(msg)
         except Exception:
             pass
-    try:
-        with open(_log_path(), 'a', encoding='utf-8') as f:
-            f.write(msg.rstrip() + '\n')
-    except Exception:
-        pass
+    storage.append_text(_log_path(), msg.rstrip() + '\n')
 
 
 def _log_exc() -> None:
@@ -159,11 +162,10 @@ def _log_exc() -> None:
             traceback.print_exc()
     except Exception:
         pass
-    try:
-        with open(_log_path(), 'a', encoding='utf-8') as f:
-            traceback.print_exc(file=f)
-    except Exception:
-        pass
+    # traceback.print_exc(file=...) 要文件句柄，storage.append_text 收字符串 —— 用 StringIO 桥接
+    buf = io.StringIO()
+    traceback.print_exc(file=buf)
+    storage.append_text(_log_path(), buf.getvalue())
 
 
 def _alert(msg: str) -> None:
@@ -236,7 +238,7 @@ def fill_slots(qtype: str, answer: str) -> int:
 # ---------------------------------------------------------------- 数据层
 class Store:
     def __init__(self) -> None:
-        self.mode = 'sqlite' if DB.exists() else 'public'
+        self.mode = 'sqlite' if storage.probe(DB) else 'public'
         self.lock = threading.RLock()          # 可重入：mark() 里包着 q()/x()
         self.prog_writable = True
         self._banks = None
@@ -245,7 +247,7 @@ class Store:
             self.con = sqlite3.connect(DB, check_same_thread=False)
             self.con.row_factory = sqlite3.Row
         else:
-            if not PUBJSON.exists():
+            if not storage.probe(PUBJSON):
                 raise SystemExit('找不到数据：先跑 tools/qbank_build.py 生成 data/qbank.sqlite，'
                                  '或放入 data/public/qbank.json')
             try:
@@ -359,25 +361,29 @@ class Store:
 
     # ---- 进度文件（仅公开模式）----
     def _load_progress_json(self) -> None:
-        if PROGJSON.exists():
+        # 走 storage.read_json：原实现是 try/except Exception → pass，
+        # 即「文件损坏不影响启动」——storage 的 default 语义与此一致。
+        raw = storage.read_json(PROGJSON, default=None)
+        if raw:
             try:
-                for pid, v in json.loads(PROGJSON.read_text(encoding='utf-8')).items():
+                for pid, v in raw.items():
                     self.con.execute('INSERT OR REPLACE INTO progress(id,state,streak,wrong,due,last_seen)'
                                      ' VALUES(?,?,?,?,?,?)',
                                      (pid, v.get('state', 'new'), v.get('streak', 0), v.get('wrong', 0),
                                       v.get('due'), v.get('last_seen')))
                 self.con.commit()
             except Exception:
-                pass  # 进度文件损坏不影响启动
+                pass  # 内容结构不对不影响启动
 
     def save_progress_json(self) -> None:
         if self.mode != 'public':
             return
         try:
             rows = self.con.execute('SELECT * FROM progress').fetchall()
-            PROGJSON.write_text(json.dumps(
-                {r['id']: {k: r[k] for k in ('state', 'streak', 'wrong', 'due', 'last_seen')} for r in rows},
-                ensure_ascii=False, indent=1), encoding='utf-8')
+            ok = storage.write_json(PROGJSON, {
+                r['id']: {k: r[k] for k in ('state', 'streak', 'wrong', 'due', 'last_seen')} for r in rows})
+            if not ok:
+                raise OSError(PROGJSON)
         except OSError:
             if self.prog_writable:  # 只提醒一次，不打断刷题
                 self.prog_writable = False
@@ -694,9 +700,9 @@ class Store:
     # ---- 学习打卡：答题自动打卡（progress.last_seen 按日聚合）+ 手动补签 ----
     def _manual_days(self) -> set:
         if not hasattr(self, '_ck_manual'):
+            raw = storage.read_json(CKJSON, default={})
             try:
-                self._ck_manual = set(json.loads(CKJSON.read_text(encoding='utf-8')).get('manual') or []) \
-                    if CKJSON.exists() else set()
+                self._ck_manual = set(raw.get('manual') or []) if isinstance(raw, dict) else set()
             except Exception:
                 self._ck_manual = set()
         return self._ck_manual
@@ -745,11 +751,7 @@ class Store:
                           for r in self.q("SELECT last_seen FROM progress WHERE last_seen IS NOT NULL"))
             if t not in days and not already:
                 days.add(t)
-                try:
-                    CKJSON.write_text(json.dumps({'manual': sorted(days)}, ensure_ascii=False, indent=1),
-                                      encoding='utf-8')
-                except OSError:
-                    pass  # 写不了就当次运行有效，不打断
+                storage.write_json(CKJSON, {'manual': sorted(days)})   # 写不了就当次运行有效，不打断
         return self.checkin()
 
     # ---- 题目备注（data/notes.json；与题库分离，重建题库不丢）----
@@ -759,7 +761,7 @@ class Store:
         if getattr(self, '_note_cache', None) is None:
             self._note_cache = {}
             try:
-                raw = json.loads(NOTESJSON.read_text(encoding='utf-8')) if NOTESJSON.exists() else {}
+                raw = storage.read_json(NOTESJSON, default={})
                 src = raw.get('notes') if isinstance(raw, dict) else None
                 if isinstance(src, dict):
                     for qid, v in src.items():
@@ -771,12 +773,7 @@ class Store:
         return self._note_cache
 
     def _save_notes(self) -> bool:
-        try:
-            NOTESJSON.write_text(json.dumps({'notes': self._notes()}, ensure_ascii=False, indent=1),
-                                 encoding='utf-8')
-            return True
-        except OSError:
-            return False   # 写不了就当次运行有效，不打断
+        return storage.write_json(NOTESJSON, {'notes': self._notes()})   # 写不了就当次运行有效，不打断
 
     def notes_list(self, limit=500) -> list:
         """每条备注都带题号/题干/题型 —— 前端据此明确「这条备注属于哪道题」。

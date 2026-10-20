@@ -34,6 +34,17 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# 打本机端口必须绕过代理。urllib 默认读 http_proxy 环境变量，会把打向 127.0.0.1 的
+# 请求也发给代理；代理连不上就回 502，症状伪装成「服务起不来」（2026-10-20 在
+# smoke_test.py 上实测到，响应体是代理的中文报错「目标计算机积极拒绝 10061」）。
+# 之前这里能过是运气 —— uvicorn 启动快、连接被复用；换个时机就会翻车。
+NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def urlopen(req, timeout=10):
+    """绕过代理的 urlopen。行为与 urllib.request.urlopen 一致，只是不走代理。"""
+    return NO_PROXY_OPENER.open(req, timeout=timeout)
+
 ROOT = Path(__file__).resolve().parent.parent
 PASS, FAIL = [], []
 
@@ -168,7 +179,7 @@ def api_smoke(m, public: bool):
                                    headers={**({'Content-Type': 'application/json'} if data else {}),
                                             **(headers or {})})
         try:
-            with urllib.request.urlopen(r, timeout=10) as resp:
+            with urlopen(r, timeout=10) as resp:
                 body = resp.read()
                 return resp.status, (json.loads(body.decode('utf-8')) if body else {}), dict(resp.headers)
         except urllib.error.HTTPError as e:
@@ -322,7 +333,7 @@ def api_smoke(m, public: bool):
                                    headers={'Origin': 'http://localhost:5173',
                                             'Access-Control-Request-Method': 'GET'})
         try:
-            with urllib.request.urlopen(r, timeout=10) as resp:
+            with urlopen(r, timeout=10) as resp:
                 check('CORS 预检：localhost:5173 放行',
                       resp.status == 200 and resp.headers.get('access-control-allow-origin') == 'http://localhost:5173',
                       resp.status)
@@ -331,7 +342,7 @@ def api_smoke(m, public: bool):
 
         # vite dist 静态挂载（api.py 底部 StaticFiles）
         try:
-            with urllib.request.urlopen('http://127.0.0.1:%d/' % port, timeout=10) as resp:
+            with urlopen('http://127.0.0.1:%d/' % port, timeout=10) as resp:
                 html = resp.read().decode('utf-8')
             check('GET / 返回 vite dist 页面', resp.status == 200 and '机械题库' in html)
         except Exception as e:
@@ -339,7 +350,7 @@ def api_smoke(m, public: bool):
         dist_js = list((ROOT / 'web' / 'dist' / 'assets').glob('index-*.js'))
         if dist_js:
             try:
-                with urllib.request.urlopen('http://127.0.0.1:%d/assets/%s' % (port, dist_js[0].name),
+                with urlopen('http://127.0.0.1:%d/assets/%s' % (port, dist_js[0].name),
                                             timeout=10) as resp:
                     check('GET /assets/index-*.js → 200', resp.status == 200)
             except Exception as e:
@@ -353,7 +364,7 @@ def api_smoke(m, public: bool):
         check('shutdown 后服务真正退出', not th.is_alive())
         _t.sleep(0.3)
         try:
-            with urllib.request.urlopen(base + '/stats', timeout=3) as resp:
+            with urlopen(base + '/stats', timeout=3) as resp:
                 check('shutdown 后端口拒连', False, resp.status)
         except Exception:
             check('shutdown 后端口拒连', True)

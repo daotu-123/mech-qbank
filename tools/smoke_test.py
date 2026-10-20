@@ -36,6 +36,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PASS, FAIL = [], []
 
+# 打本机端口必须绕过代理。urllib 默认读 http_proxy 环境变量，把打向 127.0.0.1 的
+# 请求也发给代理；代理连不上就回 502，症状伪装成「服务起不来」，极具误导性
+# （2026-10-20 追查时，子进程已打印「mech-qbank 已启动」，请求却仍是 502，
+#   响应体是代理的中文报错「目标计算机积极拒绝，无法连接 os error 10061」）。
+# 只在起子进程时清环境变量是不够的 —— 那是给子进程用的，本进程自己的 urlopen
+# 仍带代理。用 ProxyHandler({}) 构造禁用代理的 opener 才是可靠做法。
+# 本文件所有打本地端口的断言都改用它（之前那 6 处 urlopen 同样受影响）。
+NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def urlopen(req, timeout=10):
+    """绕过代理的 urlopen。行为与 urllib.request.urlopen 一致，只是不走代理。"""
+    return NO_PROXY_OPENER.open(req, timeout=timeout)
+
 
 def check(name: str, cond: bool, detail: str = ''):
     (PASS if cond else FAIL).append(name)
@@ -398,7 +412,7 @@ def http_smoke(m, tmp: Path, public: bool):
 
     def get(path):
         try:
-            with urllib.request.urlopen(base + path, timeout=10) as r:
+            with urlopen(base + path, timeout=10) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
@@ -407,7 +421,7 @@ def http_smoke(m, tmp: Path, public: bool):
         req = urllib.request.Request(base + path, data=json.dumps(obj).encode('utf-8'),
                                      headers={'Content-Type': 'application/json'})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urlopen(req, timeout=10) as r:
                 return r.status, json.loads(r.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read().decode('utf-8'))
@@ -550,7 +564,7 @@ def http_smoke(m, tmp: Path, public: bool):
             req = urllib.request.Request(base + '/api/stats', headers={'Host': host})
             code = 0
             try:
-                with urllib.request.urlopen(req, timeout=10) as r:
+                with urlopen(req, timeout=10) as r:
                     code = r.status
             except urllib.error.HTTPError as e:
                 code = e.code
@@ -567,7 +581,7 @@ def http_smoke(m, tmp: Path, public: bool):
                                      headers={'Host': '127.0.0.1', 'Origin': 'http://evil.com'})
         code = 0
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urlopen(req, timeout=10) as r:
                 code = r.status
         except urllib.error.HTTPError as e:
             code = e.code
@@ -579,7 +593,7 @@ def http_smoke(m, tmp: Path, public: bool):
         req = urllib.request.Request(base + '/api/shutdown', headers={'Host': 'evil.com'})
         code = 0
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urlopen(req, timeout=10) as r:
                 code = r.status
         except urllib.error.HTTPError as e:
             code = e.code
@@ -619,8 +633,18 @@ def subprocess_boot_smoke(tmp: Path):
     print('\n== 子进程真实启动：%s ==' % '（本项不区分公开/全量模式）')
     sandbox = tmp / 'boot'
     (sandbox / 'app').mkdir(parents=True, exist_ok=True)
-    for name in ('core.py', 'server.py', 'api.py'):
-        shutil.copy2(ROOT / 'app' / name, sandbox / 'app' / name)
+    # 整个 app/ 目录全量复制，不列文件名白名单。
+    # 硬编码列表等于一份「依赖清单」，新增模块时忘记登记，测试会以
+    # ModuleNotFoundError 报成「子进程起不来」，很容易误判成服务端坏了
+    # （2026-10-20 加 app/storage.py 时踩过：108/0 → 104/2，症状极具误导性）。
+    # 全量复制后，新增分层模块不需要改测试。
+    for src in (ROOT / 'app').glob('*.py'):
+        shutil.copy2(src, sandbox / 'app' / src.name)
+    # 显式断言：仓库里的每个 app/*.py 都真的进了沙箱。防止将来某天
+    # 上面的 glob 被改回白名单，这里就是最后一道网。
+    missing = [p.name for p in (ROOT / 'app').glob('*.py')
+               if not (sandbox / 'app' / p.name).exists()]
+    check('沙箱已同步 app/ 下全部模块', not missing, '漏掉：%s' % missing)
     # 沙箱里放一份题库副本：DB 存在才走 sqlite 分支（public 分支缺 PUBJSON 会 SystemExit）
     (sandbox / 'data').mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'data' / 'qbank.sqlite', sandbox / 'data' / 'qbank.sqlite')
@@ -737,7 +761,7 @@ def poll_http(port: int, path: str, proc, tries: int = 80, gap: float = 0.25) ->
             return 0, b''                      # 进程已死，别白等
         try:
             req = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path))
-            with urllib.request.urlopen(req, timeout=3) as r:
+            with urlopen(req, timeout=3) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
