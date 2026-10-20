@@ -28,6 +28,10 @@ import webbrowser
 from urllib.parse import urlparse
 
 import core
+# service 不从 core 传播（core 不依赖它，是反向依赖），所以本文件必须显式导入。
+# 注意 service 是纯标准库模块 —— 它不认识 fastapi，这样零依赖回退的 server.py
+# 也能 import 它，两套服务端共享同一份业务用例。
+import service
 from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log, _log_exc,
                   clamp_int)
 
@@ -46,13 +50,46 @@ SRV = None            # uvicorn.Server 实例，供 /api/v1/system/shutdown 用
 
 @app.middleware('http')
 async def guard(request: Request, call_next):
-    """Host/Origin 白名单 —— 与 server.py 的 _guard() 同语义，挡 DNS rebinding 与跨站调用。"""
+    """Host/Origin 白名单 —— 与 server.py 的 _guard() 同语义，挡 DNS rebinding 与跨站调用。
+
+    ⚠️ 公网化时**必须保留**（docs/architecture-baseline.md §0.2）：
+    它防的是 DNS rebinding 与跨站调用，与将来 W3 的鉴权**并存且职责不同** ——
+    鉴权回答「你是谁」，本守卫回答「请求是否来自允许的来源」，不可互相替代。
+    """
     host = (request.headers.get('host') or '').split(':')[0].strip()
     if host not in ALLOWED_HOSTS:
         return JSONResponse({'detail': 'forbidden'}, status_code=403)
     origin = request.headers.get('origin')
     if origin and (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
         return JSONResponse({'detail': 'forbidden'}, status_code=403)
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------- 鉴权挂载点（W3，本轮不实现）
+# 目标形态是「公网单用户 + 单账号」（docs §0.2 / §0.3），届时需要一个鉴权中间件。
+# 本轮**只留位置，不实现**：AUTH_ENABLED 为 False 时下面什么都不做，行为与重构前完全一致。
+#
+# 实现时该怎么做（写在这里免得将来重新想）：
+#   · 鉴权中间件必须挂在 guard **之后**（app.middleware 是后注册先执行，
+#     所以实际执行顺序是「后注册的先跑」—— 注册 auth 要写在 guard 之前才能让它
+#     先于 guard 跑；若希望先过 guard 再鉴权，则注册在 guard 之后）
+#   · 身份模型是单账号：口令 Argon2id，会话令牌**服务端签发、短时、可撤销**
+#     （不要用自签 JWT——自签无法撤销，与「可撤销」直接冲突）
+#   · 令牌卫生三通道（docs §0.4）：日志不得出现明文凭据、令牌不进 URL、Referrer-Policy
+#   · 现有 Host/Origin 守卫保留，二者并存
+AUTH_ENABLED = False
+
+
+@app.middleware('http')
+async def auth(request: Request, call_next):
+    """W3 鉴权占位。当前 AUTH_ENABLED=False，直接放行。
+
+    保留这个函数而不是「等要做鉴权时再加」，是为了让挂载顺序在代码里先固定下来：
+    中间件注册顺序一旦在实现时才决定，很容易和 guard 的顺序搞反。
+    """
+    if not AUTH_ENABLED:
+        return await call_next(request)
+    # ---- 实现时在这里校验会话令牌，未登录返回 401 ----
     return await call_next(request)
 
 
@@ -65,6 +102,23 @@ app.add_middleware(CORSMiddleware,
 
 def _404():
     return HTTPException(404, 'not found')
+
+
+def _raise4xx(r):
+    """把 service.Result 里的中性错误翻译成 HTTP 异常。
+
+    这是**业务语义 → HTTP 状态码的唯一转换点**。
+    service 层不认识 HTTP（它不能 import fastapi，否则零依赖回退路径当场失效），
+    所以它只能返回 reason='not found'；翻译成404 还是 400 由本层决定。
+
+    将来加鉴权（W3，见 docs/architecture-baseline.md §0.2）时，
+    「未登录 → 401」也是在这里或它上面那层做，不要散进各个端点。
+    """
+    if r.not_found:
+        raise _404()
+    if r.get('error'):
+        raise HTTPException(400, r['error'])
+    return r
 
 
 # ---------------------------------------------------------------- 请求体
@@ -108,10 +162,14 @@ def questions(level: Optional[int] = None, qtype: Optional[str] = None,
               bank: Optional[str] = None, section: Optional[str] = None,
               only_new: bool = False, review: bool = False, q: Optional[str] = None,
               limit: int = 10, sclass: Optional[str] = None):
-    """组卷/复习/搜索共用一个集合端点：默认随机组卷，review=1 取今日到期，q= 按题干搜索。"""
-    if q:
-        return {'items': STORE.search(q, limit)}
-    return {'items': STORE.pick(limit, level, qtype, sclass, bank, section, only_new, review)}
+    """组卷/复习/搜索共用一个集合端点：默认随机组卷，review=1 取今日到期，q= 按题干搜索。
+
+    本函数只做「HTTP → 业务用例」的一步转发：参数校验在 FastAPI 里已完成
+    （见上面的 Optional[...] 与类型标注），业务取题在 app/service.py。
+    """
+    return service.pick_questions(STORE, q=q, limit=limit, level=level, qtype=qtype,
+                                  sclass=sclass, bank=bank, section=section,
+                                  only_new=only_new, review=review)
 
 
 @app.post('/api/v1/questions/{qid}/grade')
@@ -125,40 +183,28 @@ def grade(qid: str, body: GradeIn):
 
 @app.get('/api/v1/questions/{qid}')
 def question(qid: str):
-    row = STORE.full(qid)
-    if not row:
+    r = service.get_question(STORE, qid)
+    if r.not_found:
         raise _404()
-    return {'item': STORE._pub_row(row)}
+    return r
 
 
 @app.get('/api/v1/questions/{qid}/note')
 def get_note(qid: str):
-    if not STORE.full(qid):
+    r = service.get_note(STORE, qid)
+    if r.not_found:
         raise _404()
-    for it in STORE.notes_list(2000):
-        if it['id'] == qid:
-            return it
-    return {'id': qid, 'note': '', 'updated_at': ''}
+    return r
 
 
 @app.put('/api/v1/questions/{qid}/note')
 def put_note(qid: str, body: NoteIn):
-    r = STORE.set_note(qid, body.note)
-    if r.get('error') == 'not found':
-        raise _404()
-    if r.get('error'):
-        raise HTTPException(400, r['error'])
-    return r
+    return _raise4xx(service.put_note(STORE, qid, body.note))
 
 
 @app.delete('/api/v1/questions/{qid}/note')
 def delete_note(qid: str):
-    r = STORE.set_note(qid, '')
-    if r.get('error') == 'not found':
-        raise _404()
-    if r.get('error'):
-        raise HTTPException(400, r['error'])
-    return r
+    return _raise4xx(service.put_note(STORE, qid, ''))
 
 
 @app.get('/api/v1/notes')

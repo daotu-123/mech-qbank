@@ -46,6 +46,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import core                                          # 数据层单例（STORE/SRV/路径常量都在它上面）
+import service                                       # 业务用例（纯标准库；与 api.py 共享同一份）
 from core import *                                   # noqa: F401,F403 数据层与常量
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
 # 关键：上面的 `import *` **会跳过下划线开头的名字**，而本文件用到 _log/_log_exc/_alert，
@@ -128,15 +129,21 @@ class H(BaseHTTPRequestHandler):
             if p == '/api/stats':
                 return self.j(STORE.stats())
             if p == '/api/quiz':
-                return self.j({'items': STORE.pick(_n_arg(q), q.get('level'), q.get('qtype'),
-                                                   q.get('class'), q.get('bank'), q.get('section'),
-                                                   q.get('only_new') == '1', q.get('review') == '1')})
+                # 取题走 service，与 api.py 的 /api/v1/questions 同一份用例。
+                # 参数照原样透传：level/class/bank/section 传字符串（None 或值），
+                # only_new/review 传布尔 —— 与重构前的调用形式完全一致。
+                return self.j(service.pick_questions(
+                    STORE, q=None, limit=_n_arg(q), level=q.get('level'), qtype=q.get('qtype'),
+                    sclass=q.get('class'), bank=q.get('bank'), section=q.get('section'),
+                    only_new=q.get('only_new') == '1', review=q.get('review') == '1'))
             if p == '/api/review':
                 # 与 /api/quiz、api.py、api.js 保持同一默认（10），参数名同时接受 n 与 limit
-                return self.j({'items': STORE.pick(_n_arg(q), q.get('level'), q.get('qtype'),
-                                                   review=True)})
+                return self.j(service.pick_questions(
+                    STORE, q=None, limit=_n_arg(q), level=q.get('level'), qtype=q.get('qtype'),
+                    review=True))
             if p == '/api/search':
-                return self.j({'items': STORE.search(q.get('q', ''), q.get('limit', 50))})
+                return self.j(service.pick_questions(
+                    STORE, q=q.get('q', ''), limit=q.get('limit', 50)))
             if p == '/api/banks':
                 return self.j({'items': STORE.banks()})
             if p == '/api/sections':
@@ -156,8 +163,12 @@ class H(BaseHTTPRequestHandler):
             if p == '/api/notes':
                 return self.j({'items': STORE.notes_list(q.get('limit', 500))})
             if p == '/api/question':
-                row = STORE.full(q.get('id', ''))
-                return self.j({'item': STORE._pub_row(row) if row else None})
+                # 业务取题走 service（与 api.py 的 /api/v1/questions/{qid} 同一份用例），
+                # 本层只负责翻译成协议响应体。
+                # ⚠️ 注意：题不存在时原实现返回 {'item': None} 而不是 404，
+                # 这个「有响应体但内容为 null」的形状是既有契约，本轮不改。
+                r = service.get_question(STORE, q.get('id', ''))
+                return self.j({'item': r.get('item')})
             if p == '/api/shutdown':
                 # windowed 打包后没有控制台可按 Ctrl+C，只能从页面退出；_guard() 已保证只有本机能调
                 def _stop():
