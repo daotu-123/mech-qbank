@@ -48,31 +48,18 @@ STORE: Optional[Store] = None
 SRV = None            # uvicorn.Server 实例，供 /api/v1/system/shutdown 用
 
 
-@app.middleware('http')
-async def guard(request: Request, call_next):
-    """Host/Origin 白名单 —— 与 server.py 的 _guard() 同语义，挡 DNS rebinding 与跨站调用。
-
-    ⚠️ 公网化时**必须保留**（docs/architecture-baseline.md §0.2）：
-    它防的是 DNS rebinding 与跨站调用，与将来 W3 的鉴权**并存且职责不同** ——
-    鉴权回答「你是谁」，本守卫回答「请求是否来自允许的来源」，不可互相替代。
-    """
-    host = (request.headers.get('host') or '').split(':')[0].strip()
-    if host not in ALLOWED_HOSTS:
-        return JSONResponse({'detail': 'forbidden'}, status_code=403)
-    origin = request.headers.get('origin')
-    if origin and (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
-        return JSONResponse({'detail': 'forbidden'}, status_code=403)
-    return await call_next(request)
-
-
 # ---------------------------------------------------------------- 鉴权挂载点（W3，本轮不实现）
 # 目标形态是「公网单用户 + 单账号」（docs §0.2 / §0.3），届时需要一个鉴权中间件。
 # 本轮**只留位置，不实现**：AUTH_ENABLED 为 False 时下面什么都不做，行为与重构前完全一致。
 #
 # 实现时该怎么做（写在这里免得将来重新想）：
-#   · 鉴权中间件必须挂在 guard **之后**（app.middleware 是后注册先执行，
-#     所以实际执行顺序是「后注册的先跑」—— 注册 auth 要写在 guard 之前才能让它
-#     先于 guard 跑；若希望先过 guard 再鉴权，则注册在 guard 之后）
+#   · 鉴权中间件要挂在 guard **之后**（先过 Host/Origin 白名单，再验身份）。
+#     挂载方式（2026-10-20 实测确认，别再搞反）：
+#     FastAPI/Starlette 的中间件是**后注册先执行** —— 装饰器写在文件里越靠后，
+#     注册越晚，跑得越早。实测：注册顺序 guard→auth 时实际执行 auth→guard；
+#     注册顺序 auth→guard 时实际执行 guard→auth。
+#     所以要让 auth 跑在 guard **之后**，auth 必须**先注册**，
+#     即本装饰器必须写在 guard 装饰器**之前**（也就是本段在下方 guard 之前）。
 #   · 身份模型是单账号：口令 Argon2id，会话令牌**服务端签发、短时、可撤销**
 #     （不要用自签 JWT——自签无法撤销，与「可撤销」直接冲突）
 #   · 令牌卫生三通道（docs §0.4）：日志不得出现明文凭据、令牌不进 URL、Referrer-Policy
@@ -86,10 +73,32 @@ async def auth(request: Request, call_next):
 
     保留这个函数而不是「等要做鉴权时再加」，是为了让挂载顺序在代码里先固定下来：
     中间件注册顺序一旦在实现时才决定，很容易和 guard 的顺序搞反。
+
+    ⚠️ 本装饰器**必须写在 guard 之前**（不是之后）：后注册先执行，
+    先注册才会后跑，从而真正挂在 guard 之后。理由见上方注释。
     """
     if not AUTH_ENABLED:
         return await call_next(request)
     # ---- 实现时在这里校验会话令牌，未登录返回 401 ----
+    return await call_next(request)
+
+
+@app.middleware('http')
+async def guard(request: Request, call_next):
+    """Host/Origin 白名单 —— 与 server.py 的 _guard() 同语义，挡 DNS rebinding 与跨站调用。
+
+    ⚠️ 公网化时**必须保留**（docs/architecture-baseline.md §0.2）：
+    它防的是 DNS rebinding 与跨站调用，与将来 W3 的鉴权**并存且职责不同** ——
+    鉴权回答「你是谁」，本守卫回答「请求是否来自允许的来源」，不可互相替代。
+
+    本装饰器**必须写在 auth 之后**（即在文件里更靠下），才能让 auth 挂在它之后执行。
+    """
+    host = (request.headers.get('host') or '').split(':')[0].strip()
+    if host not in ALLOWED_HOSTS:
+        return JSONResponse({'detail': 'forbidden'}, status_code=403)
+    origin = request.headers.get('origin')
+    if origin and (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
+        return JSONResponse({'detail': 'forbidden'}, status_code=403)
     return await call_next(request)
 
 

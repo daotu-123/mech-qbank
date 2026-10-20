@@ -42,7 +42,7 @@
 | Host/Origin 白名单只有三个 loopback 字面量 | `core.py:99` `ALLOWED_HOSTS = {'127.0.0.1','localhost','[::1]'}` |
 | 全项目**零账号、零 token、零 session** | `web/src/**` 与 `app/**` 检索 `login\|token\|auth\|userId\|sync` 无业务命中 |
 | 无登录页、无多用户切换 | `web/src/views/` 共 7 个：`TodayView / QuizView / ReviewView / WrongView / CardsView / StatsView / ExcerptView` |
-| 无速率限制 | 全项目无限流中间件；`api.py:47-56` 的 `guard` 只校验 Host/Origin |
+| 无速率限制 | 全项目无限流中间件；`api.py:86-103` 的 `guard` 只校验 Host/Origin |
 | 打包目标是桌面双击即用 | `start.bat` 拉起 `--windowed` exe；APK 走 Capacitor |
 
 #### 由「公网单用户」新增的工作块（**本次不实施，仅登记边界**）
@@ -56,7 +56,7 @@
 
 #### 公网模式下**继续保留**的部分
 
-- **Host/Origin 守卫（`api.py:47-56` `guard` / `server.py` `_guard()`）必须保留**。
+- **Host/Origin 守卫（`api.py:86-103` `guard` / `server.py` `_guard()`）必须保留**。
   它防的是 **DNS rebinding** 与跨站调用，与 W3 的鉴权**并存、职责不同、不可互相替代**：
   鉴权回答「你是谁」，守卫回答「这个请求是不是从允许的来源来的」。
 - 本机模式下的 `0.0.0.0` **不开放**——W1 默认值必须保持 `127.0.0.1`。
@@ -149,20 +149,32 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 
 ```
                         ┌──────────────────────────────────────────┐
-   浏览器 (http://) ───▶│  app/api.py    FastAPI + RESTful 传输层   │──┐
+   浏览器 (http://) ───▶│  app/api.py    FastAPI router             │──┐
    浏览器 (file://) ───▶│  web/src/api.js  → staticRoute() 分流     │  │
                         └──────────────────────────────────────────┘  │
                         ┌──────────────────────────────────────────┐  │
+                        │  app/service.py  业务用例（纯标准库）      │◀─┤
+                        │  · 不认识 HTTP：返回 Result(ok, reason)  │  │
+                        │  · 两套服务端共用同一份                 │  │
+                        └───────────────┬──────────────────────────┘  │
+                        ┌───────────────▼──────────────────────────┐  │
                         │  app/core.py   数据层（零第三方依赖）      │◀─┘
                         │  · Store：sqlite / public JSON 自动降级  │
                         │  · grade / mark / schedule / pick         │
                         │  · checkin / notes / custom 题 CRUD       │
                         │  · FSRS 排期（py-fsrs）、_log 日志         │
-                        └───────────────┬──────────────────────────┘
-                                        │ from core import ...
-                        ┌───────────────▼──────────────────────────┐
-                        │  app/server.py  标准库 http.server 版     │  ← 遗留回退路径（见 §8-c）
-                        │  同一份 core.py，传输层是 if 路由链        │
+                        └───────┬───────────────────┬──────────────┘
+                                │                   │
+              ┌─────────────────▼──────┐  ┌─────────▼────────────────────┐
+              │ app/repository.py      │  │ app/storage.py              │
+              │ SQL 唯一出口            │  │ 文件读写唯一出口            │
+              │ 加锁+执行+取行绑在一起   │  │ probe/read_json/write_json  │
+              │ （纯标准库）             │  │ （纯标准库）                │
+              └─────────────────────────┘  └────────────────────────────┘
+
+                        ┌──────────────────────────────────────────┐
+                        │  app/server.py  标准库 http.server router │  ← 零依赖回退路径
+                        │  同一份 service.py + core.py，路由是 if 链  │
                         └──────────────────────────────────────────┘
 
    web/（Vue 3 + Element Plus + Vite）
@@ -182,11 +194,25 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 
 | 层 | 依赖 | 反向依赖 |
 |---|---|---|
-| `app/api.py` | `app/core.py`、fastapi/uvicorn | 无 |
-| `app/server.py` | `app/core.py`（`import core` + `from core import *`） | 无 |
-| `app/core.py` | 仅标准库（可选 `py-fsrs`） | 不知道 HTTP 存在 |
+| `app/api.py` | `app/service.py`、`app/core.py`、fastapi/uvicorn | 无 |
+| `app/server.py` | `app/service.py`、`app/core.py`（`import core` + `from core import *`） | 无 |
+| `app/service.py` | **仅标准库**（不 import core —— store 由调用方传入） | 无 |
+| `app/core.py` | `app/repository.py`、`app/storage.py`、仅标准库（可选 `py-fsrs`） | 不知道 HTTP 存在 |
+| `app/repository.py` | 仅标准库（连接与锁由调用方传入） | 无 |
+| `app/storage.py` | 仅标准库（路径由调用方传入） | 无 |
 | `web/src/**` | `api.js` → `static-store.js` | 无 |
 | `tools/**` | `app/core.py`（差分/审查）、`web/src/store/static-store.js`（Node 侧） | 无 |
+
+**两条不可违反的分层约束**（2026-10-20 分层时确立）：
+
+1. **`app/storage.py` / `app/repository.py` / `app/service.py` 必须保持纯标准库。**
+   `app/server.py` 是零第三方依赖的回退服务端（`start.bat:22-27` 在 fastapi 不可用时启动它），
+   任何一层引入第三方依赖都会让这条回退路径直接失效。
+   也因此 `service.py` **不能**做 HTTP 错误翻译（那需要 import fastapi），
+   只能返回中性的 `Result(ok=False, reason=...)`，由 router 层的 `_raise4xx()` 翻译。
+2. **路由装饰器必须留在 `app/api.py`。**
+   `tools/smoke_api.py:145` 用正则从 api.py 源码抓 `@app.xxx('/api/v1...')` 来做
+   前后端接口契约校验，路由整体搬走会让该断言失效。
 
 **双端手抄关系（唯一的跨语言耦合）**：`app/core.py` 与 `web/src/store/static-store.js` 各自实现一遍判分、排期、组卷、备注、打卡口径，靠 `tools/smoke_parity.py` 差分守护。详见 §6。
 
@@ -198,32 +224,36 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 
 | 方法 | 路径 | 行号 | 说明 |
 |---|---|---|---|
-| GET | `/api/v1/questions` | `api.py:106` | 组卷/复习/搜索统一集合端点（`review=1` 取到期，`q=` 搜索，`limit` 夹 1–100） |
-| POST | `/api/v1/questions/{qid}/grade` | `api.py:117` | 判分，返回 `{id, correct, answer, explanation, self, fill?}` |
-| GET | `/api/v1/questions/{qid}` | `api.py:126` | 单题（走 `_pub_row`，不下发 answer） |
-| GET | `/api/v1/questions/{qid}/note` | `api.py:134` | 读单题备注 |
-| PUT | `/api/v1/questions/{qid}/note` | `api.py:144` | 写备注（空串=删除） |
-| DELETE | `/api/v1/questions/{qid}/note` | `api.py:154` | 删备注 |
-| GET | `/api/v1/notes` | `api.py:164` | 备注列表（默认 500，上限 2000） |
-| POST | `/api/v1/import_questions` | `api.py:170` | 批量导入自定义题（PDF 摘录编辑器） |
-| POST | `/api/v1/custom` | `api.py:177` | 新建单道自定义题 |
-| GET | `/api/v1/custom` | `api.py:185` | 自定义题列表（不含答案） |
-| DELETE | `/api/v1/custom/{qid}` | `api.py:190` | 删自定义题（级联清 progress） |
-| GET | `/api/v1/progress` | `api.py:199` | 导出进度 |
-| POST | `/api/v1/progress` | `api.py:204` | 导入进度（合并） |
-| PUT | `/api/v1/progress/{qid}` | `api.py:209` | 记录结果（mark） |
-| GET | `/api/v1/wrong` | `api.py:216` | 错题本 |
-| GET | `/api/v1/stats` | `api.py:222` | 总览统计 |
-| GET | `/api/v1/banks` | `api.py:227` | 题库分布 |
-| GET | `/api/v1/sections` | `api.py:232` | 章节来源分布 |
-| GET | `/api/v1/chapters` | `api.py:237` | 知识点章节 |
-| GET | `/api/v1/cards` | `api.py:242` | 知识点卡片搜索 |
-| GET | `/api/v1/checkins` | `api.py:248` | 打卡日历（`?month=YYYY-MM`） |
-| POST | `/api/v1/checkins` | `api.py:253` | 手动补签 |
-| POST | `/api/v1/system/shutdown` | `api.py:259` | 退出服务（置 `SRV.should_exit`，见 `api.py:263-266`） |
-| — | `mount('/', StaticFiles(web/dist))` | `api.py:323-325` | `web/dist` 存在才挂；否则 `GET /` 返回 503 |
+| GET | `/api/v1/questions` | `api.py:169` | 组卷/复习/搜索统一集合端点（`review=1` 取到期，`q=` 搜索，`limit` 夹 1–100） |
+| POST | `/api/v1/questions/{qid}/grade` | `api.py:184` | 判分，返回 `{id, correct, answer, explanation, self, fill?}` |
+| GET | `/api/v1/questions/{qid}` | `api.py:193` | 单题（走 `_pub_row`，不下发 answer） |
+| GET | `/api/v1/questions/{qid}/note` | `api.py:201` | 读单题备注 |
+| PUT | `/api/v1/questions/{qid}/note` | `api.py:209` | 写备注（空串=删除） |
+| DELETE | `/api/v1/questions/{qid}/note` | `api.py:214` | 删备注 |
+| GET | `/api/v1/notes` | `api.py:219` | 备注列表（默认 500，上限 2000） |
+| POST | `/api/v1/import_questions` | `api.py:225` | 批量导入自定义题（PDF 摘录编辑器） |
+| POST | `/api/v1/custom` | `api.py:232` | 新建单道自定义题 |
+| GET | `/api/v1/custom` | `api.py:240` | 自定义题列表（不含答案） |
+| DELETE | `/api/v1/custom/{qid}` | `api.py:245` | 删自定义题（级联清 progress） |
+| GET | `/api/v1/progress` | `api.py:254` | 导出进度 |
+| POST | `/api/v1/progress` | `api.py:259` | 导入进度（合并） |
+| PUT | `/api/v1/progress/{qid}` | `api.py:264` | 记录结果（mark） |
+| GET | `/api/v1/wrong` | `api.py:271` | 错题本 |
+| GET | `/api/v1/stats` | `api.py:277` | 总览统计 |
+| GET | `/api/v1/banks` | `api.py:282` | 题库分布 |
+| GET | `/api/v1/sections` | `api.py:287` | 章节来源分布 |
+| GET | `/api/v1/chapters` | `api.py:292` | 知识点章节 |
+| GET | `/api/v1/cards` | `api.py:297` | 知识点卡片搜索 |
+| GET | `/api/v1/checkins` | `api.py:303` | 打卡日历（`?month=YYYY-MM`） |
+| POST | `/api/v1/checkins` | `api.py:308` | 手动补签 |
+| POST | `/api/v1/system/shutdown` | `api.py:314` | 退出服务（置 `SRV.should_exit`，见 `api.py:317-320`） |
+| — | `mount('/', StaticFiles(web/dist))` | `api.py:378-380` | `web/dist` 存在才挂；否则 `GET /` 返回 503 |
 
-传输层规则：Host/Origin 白名单中间件 `api.py:47-56`；CORS 只放行 localhost 任意端口 `api.py:61-63`。
+传输层规则：Host/Origin 白名单中间件 `api.py:86-103`；CORS 只放行 localhost 任意端口 `api.py:107-109`；
+W3 鉴权占位中间件 `api.py:70-84`（`AUTH_ENABLED=False` 当前不生效）。
+**中间件执行顺序（2026-10-20 实测）**：FastAPI/Starlette **后注册先执行**。
+当前实际顺序 CORS → guard → auth，即 auth 挂在 guard **之后**（先过白名单、再验身份），
+符合 W3 的意图。要改这个顺序，只能调换装饰器在文件里的位置 —— 写在**后面**的先跑。
 
 ### 2.2 `app/server.py` — 零依赖回退路径（14 个 API + 4 个静态）
 
@@ -345,6 +375,32 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 
 `pick()`（`core.py:443-483` / `static-store.js:411-450`，含"先随机抽 n 再按题型标签排序"的语义）、`stats()`（`core.py:418-441` / `static-store.js:513-536`）、`checkin()`（`core.py:704-739` / `static-store.js:592-634`，周一起始月历与连续天数）、`notes_list()/setNote()`（`core.py:781/812` / `static-store.js:673/691`）、自定义题规范化与导入（`core.py:836/913` / `static-store.js:177/200`）。
 
+### 6.4 已知脆弱点：`_fsrs_save()` 不提交（**有意为之，不是遗漏**）
+
+**位置**：`app/core.py` `Store._fsrs_save()` —— 写 `fsrs_state` 表时**不 commit**。
+
+**为什么这是对的**（2026-10-20 owner 复核确认）：
+
+`mark()` 里 `schedule()` 写完 `fsrs_state` 后，紧接着的 progress 写入会 commit，
+**两条写在同一个事务里原子落盘**。若给 `_fsrs_save()` 单独加 commit，
+就变成「卡片先落盘、进度后落盘」，中间崩溃会产生
+**「有排期但没进度」的不一致状态**。所以不 commit 是这个设计的**一部分**。
+
+**已知脆弱点（写明以免将来误判为 bug）**：
+
+> `schedule()` 是**公开方法**。若在 `mark()` 之外直接调用（且 `dry=False`），
+> 写入**不会被 commit**，要等同连接上发生其他 commit 才落盘。
+> 单连接下碰巧能用（后续任何写操作都会带它落盘），但**这不是可靠契约**。
+
+**将来要修的正确做法**（**独立任务，需要自己的测试**）：
+
+> 让 `mark()` 用**显式 `BEGIN` / `COMMIT`** 包住 FSRS 写入与 progress 写入，
+> **而不是**给 `_fsrs_save()` 单独加 commit —— 后者正是上面要避免的那种拆分提交。
+
+**当前实现**：`app/repository.py` 提供了 `execute_nowait()`（加锁但不 commit）
+专供此路径使用，注释里写明了「不要在新代码里用它，除非在复刻一个
+『原本就不提交』的历史行为」。
+
 ---
 
 ## 7. 现有测试脚本各自覆盖什么
@@ -455,7 +511,7 @@ web/dist/qbank-data.js
 
 | 报告条目 | 现状 | 证据 |
 |---|---|---|
-| 3.1 P0 无 Host/Origin 校验（DNS rebinding） | ✅ **已修** | `core.py:99` `ALLOWED_HOSTS`；`api.py:47-56` 中间件；`server.py:79-92` `_guard()` |
+| 3.1 P0 无 Host/Origin 校验（DNS rebinding） | ✅ **已修** | `core.py:99` `ALLOWED_HOSTS`；`api.py:86-103` 中间件；`server.py:79-92` `_guard()` |
 | 3.2 P1 500 响应回显异常原文 | ✅ **已修** | `server.py:166-168` 只 `_log_exc()`、回 `{'error':'internal error'}`；`api.py` 无自定义异常回显，FastAPI 默认不回显 traceback |
 | 3.3 P2 `esc()` 少转义单引号 / 二次注入 | ⛔ **已不适用** | 主渲染已换 Vue 模板（自动转义）；仅 `ImportCard.vue:67` 还保留一个 `esc`，且该处**已包含 `'` 转义**。`innerHTML` 全项目仅剩 `App.vue:73`（退出服务后替换整页） |
 | 2.2 P1 `mark()` 锁内磁盘 I/O | ✅ **已修** | `core.py:629-666`：锁内只做 sqlite 写，落盘挪到锁外 `_schedule_progress_save()`（1 秒防抖 + atexit 兜底） |
