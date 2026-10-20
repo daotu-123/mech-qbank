@@ -36,6 +36,15 @@ import errors
 # 注意 service 是纯标准库模块 —— 它不认识 fastapi，这样零依赖回退的 server.py
 # 也能 import 它，两套服务端共享同一份业务用例。
 import service
+# multipart 是纯标准库的 multipart/form-data 解析器。
+# 为什么不用 FastAPI 的 UploadFile/File()：它们依赖第三方包 python-multipart，
+# 本机 .venv-build 里没有装（实测 import multipart → ModuleNotFoundError），
+# 而本项目明确不引入新依赖。与 server.py 共用同一份实现，保证两端行为等价。
+import multipart
+# docstore 是 PDF 文档域（落盘 + job 表 + 后台解析线程），纯标准库。
+# 它 import 的是 pdf_client（纯标准库）而不是 pdf_extract（会拖进 pymupdf），
+# 所以 Web 进程永远不持有 MuPDF。
+import docstore
 from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log, _log_exc,
                   clamp_int)
 
@@ -381,6 +390,92 @@ def delete_custom(qid: str):
     return r
 
 
+# ---------------------------------------------------------------- PDF 文档
+# 解析一律异步：上传立刻 202 + job id，前端轮询 GET /parse-jobs/{id}。
+# 实测端到端 2.2–3.1s（其中 import pymupdf 冷启动 2.0s），同步等待会像卡死。
+#
+# ⚠️ 为什么不用 FastAPI 的 UploadFile/File()：它们依赖第三方包
+# `python-multipart`，本机 .venv-build 里**没有装**（实测
+# `import multipart` → ModuleNotFoundError），而本项目明确不引入新依赖。
+# 所以这里读原始 body，用 app/multipart.py 自己解析——纯标准库，
+# 且与 server.py 共用同一份实现，保证两端行为等价。
+#
+# ⚠️ 这组端点**不 import pymupdf**：解析走 app/pdf_client.py，
+# 由它 spawn 独立 worker 进程，Web 进程始终不持有 MuPDF。
+
+DOCSTORE = None            # app/docstore.py 的实例，在 main() 里初始化
+
+
+@app.post('/api/v1/documents')
+async def create_document(request: Request):
+    """上传 PDF（multipart/form-data）→ **立刻 202** + {document, job}。
+
+    202 的含义是「已受理，解析在后台进行」，不是「已完成」。
+    调用方拿 job.id 去轮询 GET /parse-jobs/{id}。
+    """
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    body = await request.body()
+    try:
+        parts = multipart.parse_multipart(body, request.headers.get('content-type', ''))
+    except multipart.MultipartError as exc:
+        raise HTTPException(400, 'invalid multipart: %s' % exc)
+    part = multipart.first_file(parts)
+    if part is None:
+        raise HTTPException(400, 'no file part in multipart body')
+    r = service.create_document(DOCSTORE, part.filename, part.data)
+    if not r.ok:
+        raise HTTPException(400, r.reason)
+    return JSONResponse(status_code=202, content=dict(r))
+
+
+@app.get('/api/v1/documents')
+def list_documents():
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    return service.list_documents(DOCSTORE)
+
+
+@app.get('/api/v1/documents/{doc_id}')
+def get_document(doc_id: str):
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    r = service.get_document(DOCSTORE, doc_id)
+    if r.not_found:
+        raise _404()
+    return r
+
+
+@app.get('/api/v1/documents/{doc_id}/pages')
+def get_document_pages(doc_id: str, page: int = 1):
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    r = service.get_document_page(DOCSTORE, doc_id, page)
+    if r.not_found:
+        raise _404()
+    return r
+
+
+@app.delete('/api/v1/documents/{doc_id}')
+def delete_document(doc_id: str):
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    r = service.delete_document(DOCSTORE, doc_id)
+    if r.not_found:
+        raise _404()
+    return r
+
+
+@app.get('/api/v1/parse-jobs/{job_id}')
+def get_parse_job(job_id: str):
+    if DOCSTORE is None:
+        raise HTTPException(503, 'document store not ready')
+    r = service.get_job(DOCSTORE, job_id)
+    if r.not_found:
+        raise _404()
+    return r
+
+
 # ---------------------------------------------------------------- 进度
 @app.get('/api/v1/progress')
 def export_progress():
@@ -502,12 +597,24 @@ def _pick_port():
 
 
 def main() -> int:
-    global STORE, SRV
+    global STORE, SRV, DOCSTORE
     try:
         STORE = Store()
     except Exception:
         _log_exc()
         _alert('启动失败：数据初始化出错，详见 exe 同目录的 qbank.log')
+        return 1
+    # 文档域：落盘目录在 <DATA>/documents。
+    # 启动时把**遗留的** running/queued 标成 interrupted —— 不假装成功
+    # （进程上次是在解析途中被杀的）。
+    try:
+        DOCSTORE = docstore.DocStore(core.DATA / 'private' / 'documents', store=STORE)
+        orphans = DOCSTORE.reap_orphans()
+        if orphans:
+            _log('  文档：%d 个任务因上次进程中断被标记为 interrupted' % len(orphans))
+    except Exception:
+        _log_exc()
+        _alert('启动失败：文档存储初始化出错，详见 exe 同目录的 qbank.log')
         return 1
     s = STORE.stats()
     _log('mech-qbank（FastAPI）数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'

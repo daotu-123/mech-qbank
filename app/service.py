@@ -112,3 +112,100 @@ def get_question(store, qid: str) -> Result:
     if not row:
         return Result(ok=False, reason='not found')
     return Result({'item': store._pub_row(row)})
+
+
+# ---------------------------------------------------------------- PDF 文档
+# 这一组用例是 M3.3 新增的，操作对象是「PDF 文档 + 解析任务」，
+# 不是题库里的题。两套服务端（api.py / server.py）共用同一份实现，
+# 保证同一个请求在两边得到**结构完全一致**的响应。
+#
+# ⚠️ 这里 import 的是 docstore（纯标准库）与 pdf_client（纯标准库），
+# **不是** pdf_extract——后者会 import pymupdf，把 MuPDF 拖进 Web 进程。
+# 解析一律经 pdf_client 走独立 worker 进程。
+
+
+def create_document(docstore, filename: str, blob: bytes) -> Result:
+    """落盘一个 PDF 并建解析任务，**立即返回**（不等待解析）。
+
+    返回 {'document': {...}, 'job': {...}}。
+    解析在后台线程里跑，调用方拿 job id 去轮询 GET /parse-jobs/{id}。
+
+    ⚠️ 顺序很要紧：**先建 job，再一次性写入含 job_id 的元数据**。
+    反过来（先写元数据再补 job_id）会有一个窗口：后台线程在这两步之间
+    读到了 job_id 为空的元数据，把它覆盖回去 → job_id 丢失，
+    之后 GET /parse-jobs/{id} 查不到、删除时也级联不掉 job。
+    """
+    if not blob:
+        return Result(ok=False, reason='empty file')
+    meta = docstore.save_blob(blob, filename)
+    if not meta:
+        return Result(ok=False, reason='cannot store file')
+    job = docstore.create_job(meta['id'])
+    meta['job_id'] = job['id']
+    # ⚠️ 这一步必须在 job 建好之后、**且后台线程启动之前**完成，
+    # 否则 worker 可能先读到 job_id 为空的元数据。
+    if not docstore.write_meta(meta):
+        return Result(ok=False, reason='cannot store metadata')
+    docstore.start_worker()
+    return Result({'document': meta, 'job': job})
+
+
+def list_documents(docstore) -> Result:
+    """文档列表。**只给摘要**，不返回页文本（那个可能很大）。"""
+    items = []
+    for meta in docstore.list_meta():
+        items.append({
+            'id': meta.get('id', ''),
+            'original_name': meta.get('original_name', ''),
+            'sha256': meta.get('sha256', ''),
+            'bytes': meta.get('bytes', 0),
+            'created_at': meta.get('created_at', ''),
+            'status': meta.get('status', ''),
+            'result_status': meta.get('result_status', ''),
+            'page_count': meta.get('page_count', 0),
+            'total_chars': meta.get('total_chars', 0),
+            'columns_detected': meta.get('columns_detected', 1),
+            'table_pages': meta.get('table_pages', []),
+        })
+    return Result({'items': items})
+
+
+def get_document(docstore, doc_id: str) -> Result:
+    """文档详情。不存在 → not_found（router 翻成 404）。"""
+    meta = docstore.read_meta(doc_id)
+    if not meta:
+        return Result(ok=False, reason='not found')
+    return Result({'document': meta})
+
+
+def get_job(docstore, job_id: str) -> Result:
+    """解析任务状态。**job 表不跨重启持久化**，重启后查旧 id 会 404。"""
+    job = docstore.get_job(job_id)
+    if not job:
+        return Result(ok=False, reason='not found')
+    return Result({'job': job})
+
+
+def get_document_page(docstore, doc_id: str, page: int) -> Result:
+    """取某一页的文本。page 从 1 起。
+
+    越界 → not_found。文档不存在 → not_found。
+    """
+    meta = docstore.read_meta(doc_id)
+    if not meta:
+        return Result(ok=False, reason='not found')
+    pages = docstore.read_pages(doc_id)
+    if not pages:
+        return Result(ok=False, reason='not found')
+    if page < 1 or page > len(pages):
+        return Result(ok=False, reason='not found')
+    return Result({'document_id': doc_id, 'page': page,
+                   'page_count': len(pages), 'item': pages[page - 1]})
+
+
+def delete_document(docstore, doc_id: str) -> Result:
+    """删除文档，**级联**清理 PDF/页文本/元数据/job/由它生成的题目草稿。"""
+    r = docstore.delete(doc_id)
+    if r.get('error'):
+        return Result(ok=False, reason='not found')
+    return Result(r)

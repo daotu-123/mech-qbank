@@ -141,7 +141,8 @@ def worker_command(input_path: str, output_path: str, frozen=None, python=None):
     return [exe, WORKER_SCRIPT, input_path, output_path]
 
 
-def extract_in_worker(blob: bytes, timeout: float = None, frozen=None, python=None) -> dict:
+def extract_in_worker(blob: bytes, timeout: float = None, frozen=None,
+                      python=None, wait: float = 0.0) -> dict:
     """把 PDF 字节交给独立 worker 进程抽取，返回结果 dict。
 
     参数
@@ -149,6 +150,8 @@ def extract_in_worker(blob: bytes, timeout: float = None, frozen=None, python=No
         timeout   秒，默认 60；None 表示用 DEFAULT_TIMEOUT
         frozen    覆盖 frozen 判定，仅供测试打桩
         python    覆盖解释器路径，仅供测试打桩
+        wait      等待并发锁的秒数。0 = 不等，拿不到立刻返回 busy（默认）；
+                  >0 = 最多等这么久再放弃。docstore 用它实现「排队」语义。
 
     返回
         成功：与 `pdf_extract.extract(blob)` **内容完全一致**的 dict
@@ -170,8 +173,23 @@ def extract_in_worker(blob: bytes, timeout: float = None, frozen=None, python=No
         return _blank('corrupt', 'payload_too_large',
                       'input %d bytes exceeds limit %d' % (len(blob), MAX_INPUT_BYTES))
 
-    # ---- 并发上限 1：非阻塞获取，拿不到立刻返回 busy ----
-    if not _spawn_lock.acquire(blocking=False):
+    # ---- 并发上限 1 ----
+    #
+    # 默认是**非阻塞**获取：拿不到立刻返回 busy。这是对直接调用方的正确语义
+    # （HTTP 请求不该被另一个解析无限期挂住）。
+    #
+    # 但 docstore 的排队语义需要「等锁」而不是「失败」——那里已经自己
+    # 串行化了（一个后台线程一次一个 job），如果这里再 fail-fast，
+    # 两个 DocStore 实例（测试里并排跑两套服务端时就会发生）会互相把
+    # 对方的 job 打成 status='busy'，那是**假失败**。
+    #
+    # 所以加一个可选的 wait 参数：等待锁，最多等 wait 秒。
+    # 默认 0 = 不等（保持已验证的 fail-fast 行为不变）。
+    if wait and wait > 0:
+        got = _spawn_lock.acquire(timeout=wait)
+    else:
+        got = _spawn_lock.acquire(blocking=False)
+    if not got:
         _log('note=busy action=rejected')
         return _blank('busy', 'too_many_requests',
                       'another pdf worker is still running')

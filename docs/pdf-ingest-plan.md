@@ -646,14 +646,105 @@ owner 用同版本复现出完全相反的结果（他 10–30% 都能打开、7
 
 ---
 
-## 5. 若批准，实施顺序（每步一个 commit）
+## 5. 实施顺序（每步一个 commit）与完成状态
 
-1. `app/pdf_worker.py` + `app/pdfclient.py`（含 frozen 分支），用六样本跑通，
-   加一个不依赖 fastapi 的 `tools/smoke_pdf.py`。
-2. `service.extract_pdf()` + 两套服务端的 `/api/v1/pdf/extract`，错误码按【K】扩。
-3. 双栏算法 + 页码 + 乱码/扫描件标注，用现有六样本做回归断言。
-4. 前端接入 `ExcerptView`（零新增依赖），`[第 N 页]` 锚点 + 状态标记。
-5. 打包验证：`dist\mech-qbank.exe` 下 worker 分支可用、`--windowed` 下结果能回传。
+| # | 步骤 | 状态 | 提交 |
+|---|---|---|---|
+| 1 | `app/pdf_worker.py` + `app/pdf_client.py`（含 frozen 分支） | 已完成 | `fdc8288` |
+| 2 | `app/docstore.py` + `app/multipart.py` + `service` 文档用例 + 两套服务端 `/api/v1/documents*` | 已完成 | 本次提交 |
+| 3 | 双栏算法 + 页码 + 乱码/扫描件标注（抽取器内部） | 已完成 | `e2d4938` |
+| 4 | 前端接入（零新增依赖） | 未做 | M3.5 |
+| 5 | 打包验证：`dist\mech-qbank.exe` 下 worker 分支可用 | 未做 | M3.4 |
+
+### 5.1 M3.3 的 HTTP 接口（两套服务端等价）
+
+```
+POST   /api/v1/documents                    multipart → 立即 202 + {document, job}
+GET    /api/v1/documents                    列表
+GET    /api/v1/documents/{id}               详情
+GET    /api/v1/documents/{id}/pages?page=1  按页文本
+DELETE /api/v1/documents/{id}               删除（级联）
+GET    /api/v1/parse-jobs/{id}              解析任务状态
+```
+
+**上传立刻 202，不同步解析。** 实测 500 页样本的耗时拆分：
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| 落盘 PDF（0.4 MB） | 0.006 s | 0% |
+| **冷启动**（起 worker + `import pymupdf`） | **1.776 s** | **79%** |
+| 纯抽取（500 页 / 146,784 字符） | 0.462 s | 21% |
+| 页文本落盘（500 页 → 508 KB JSON） | 0.006 s | 0% |
+| **HTTP 上传响应** | **0.016 s** | — |
+
+**冷启动占 79%** —— 这就是「202 + 轮询」而不是「同步等待加转圈」的全部理由：
+用户等的是 16ms 的 202，不是 2.25s 的转圈。
+
+### 5.2 任务状态：内存 job 表，**不跨重启持久化**
+
+job 状态机：`queued → running → succeeded | failed`，重启遗留的标 `interrupted`。
+
+- **job 表在内存**：进程重启后 `GET /parse-jobs/{id}` 返回 404。
+- **磁盘上的 PDF 与页文本保留**（那是用户的数据）。
+- 但「重启前有 job 正在 running」不能装作没发生过 → 启动时 `reap_orphans()`
+  把遗留的 running/queued 标成 `interrupted`。**不假装成功。**
+- 这两件事不矛盾：不持久化 job 表 =「不假装还记得」；
+  保留 orphaned 标记 =「不假装成功」。
+
+### 5.3 并发上限 1：**排队**，不拒绝
+
+第二个上传请求**排队**（job 状态 `queued`），不是被拒。
+理由：一个坏 PDF 不该把后续请求全拖住；但也不能并发 spawn（117 MB × N 会顶爆）。
+本层用**一个后台线程一次处理一个 job**来保证。
+
+> `pdf_client` 内部还有一道非阻塞锁（fail-fast 返回 busy）。那是给直接调用方的
+> 防御性设计；本层已串行，正常路径撞不到。真撞上时（如两套服务端并排跑，
+> 共享同一个 client 模块级锁）**重试一次**而不是把用户的 PDF 判成失败——
+> **假失败比排队更糟**。为此给 `extract_in_worker` 加了 `wait` 参数
+> （默认 0 = 不等，保持已验证的 fail-fast 行为不变）。
+
+### 5.4 存储与删除
+
+```
+<DATA>/private/documents/<随机键>.pdf        原始文件（随机键命名）
+<DATA>/private/documents/<随机键>.json       元数据（sha256 / 字节数 / 原始文件名 / 状态 / job id）
+<DATA>/private/documents/<随机键>.pages.json 页文本
+```
+
+**原始文件名只作元数据，绝不参与路径拼接**（否则 `../../evil` 这类名字能写到任意位置）。
+随机键 = `secrets.token_hex(8)`。
+
+删除**级联**：原始 PDF + 页文本 + 元数据 + job 表项 + **由它生成的题目草稿**
+（按题号前缀 `X+<doc_id>+` 匹配，走 `store.delete_custom`，它自己会级联删 progress）。
+
+### 5.5 明确不做
+
+- **不做鉴权**（M2 未做）→ **这段代码上线前必须是本地/内网**。
+- 不做前端（M3.5）。
+- 不引入新依赖。
+
+> **手写 multipart 解析的原因**：FastAPI 的 `UploadFile`/`File()` 依赖第三方包
+> `python-multipart`，本机 `.venv-build` 里**没有装**（实测 `import multipart` →
+> `ModuleNotFoundError`）。既然不引入新依赖，就自己解析——`app/multipart.py`
+> 纯标准库，**两套服务端共用同一份**，这是「行为等价」的基础。
+
+### 5.6 实现期抓到的三个真 bug（都是并发下的，只在真跑起来才暴露）
+
+1. **原子写的临时文件名不能固定。** 早期用固定的 `<id>.json.tmp`，
+   请求线程（写 job_id）与后台线程（写 status）同时写时互相 replace 掉对方的 tmp，
+   目标文件变成半截 JSON → `read_meta` 返回 None → **GET 文档 404**。
+   改成唯一 tmp 名 + `os.replace`。
+2. **元数据的「读-改-写」必须原子。** 后台线程写 status、请求线程写 job_id，
+   各自 read → 改 → write 会**丢失更新**（后写的把先写的字段覆盖回旧值，
+   job_id 直接消失）。新增 `update_meta()`（按文档粒度加锁），
+   所有改元数据的地方都走它。
+3. **后缀互相包含的坑**：页文本文件是 `.pages.json`，**也以 `.json` 结尾**，
+   被 `list_meta()` 当成元数据读进来 → 读到的是 list → `m.get(...)` 抛
+   AttributeError → **列表接口 500**。
+
+三条都补了并发回归测试（`test_concurrent_meta_writes_do_not_corrupt` /
+`test_update_meta_is_atomic_read_modify_write` / `test_pages_json_not_treated_as_metadata`），
+并用注入验证过它们真能变红。
 
 ---
 

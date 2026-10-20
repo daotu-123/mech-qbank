@@ -48,6 +48,8 @@ from urllib.parse import urlparse, parse_qs
 import core                                          # 数据层单例（STORE/SRV/路径常量都在它上面）
 import errors                                       # 统一错误格式 + request_id（纯标准库，与 api.py 同一份）
 import service                                       # 业务用例（纯标准库；与 api.py 共享同一份）
+import multipart                                     # multipart/form-data 解析（纯标准库，与 api.py 同一份）
+import docstore                                      # PDF 文档域（纯标准库；import 的是 pdf_client，不是 pymupdf）
 import time                                          # request_context 用它计时
 from core import *                                   # noqa: F401,F403 数据层与常量
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
@@ -56,6 +58,10 @@ from core import STORE as _CORE_STORE                # noqa: F401  （保持 STO
 # 三个都要导：_alert 只出现在「启动失败」与「端口全被占用」两条路径上，漏了它们照样崩。
 # app/api.py:31 已是同样的写法，两边保持一致。
 from core import _alert, _log, _log_exc              # noqa: F401
+
+#: PDF 文档域实例（落盘 + job 表 + 后台解析线程）。在 main() 里初始化。
+#: 与 api.py 的 DOCSTORE 是同一份实现（app/docstore.py），保证两端行为等价。
+DOCSTORE = None
 
 
 def _n_arg(q: dict, default: int = 10) -> int:
@@ -224,6 +230,56 @@ class H(BaseHTTPRequestHandler):
                         pass
                 threading.Thread(target=_stop, daemon=True).start()
                 return self.j({'ok': True})
+
+            # ---- PDF 文档（与 api.py 的 /api/v1/documents* 等价）----
+            # 解析是异步的：上传立刻 202 + job id，前端轮询 /api/v1/parse-jobs/{id}。
+            if p == '/api/v1/documents':
+                if DOCSTORE is None:
+                    self._logreq(503, 'document store not ready')
+                    return self.jerr('internal_error', 'document store not ready')
+                return self.j(service.list_documents(DOCSTORE))
+            if p.startswith('/api/v1/documents/'):
+                rest = p[len('/api/v1/documents/'):]
+                parts = [x for x in rest.split('/') if x]
+                if not parts:
+                    self._logreq(404)
+                    return self.jerr('not_found')
+                doc_id = parts[0]
+                if len(parts) == 2 and parts[1] == 'pages':
+                    if DOCSTORE is None:
+                        self._logreq(503, 'document store not ready')
+                        return self.jerr('internal_error', 'document store not ready')
+                    try:
+                        page = int(q.get('page', '1'))
+                    except (TypeError, ValueError):
+                        page = 1
+                    r = service.get_document_page(DOCSTORE, doc_id, page)
+                    if r.not_found:
+                        self._logreq(404)
+                        return self.jerr('not_found')
+                    return self.j(r)
+                if len(parts) == 1:
+                    if DOCSTORE is None:
+                        self._logreq(503, 'document store not ready')
+                        return self.jerr('internal_error', 'document store not ready')
+                    r = service.get_document(DOCSTORE, doc_id)
+                    if r.not_found:
+                        self._logreq(404)
+                        return self.jerr('not_found')
+                    return self.j(r)
+            if p.startswith('/api/v1/parse-jobs/'):
+                job_id = p[len('/api/v1/parse-jobs/'):]
+                if not job_id:
+                    self._logreq(404)
+                    return self.jerr('not_found')
+                if DOCSTORE is None:
+                    self._logreq(503, 'document store not ready')
+                    return self.jerr('internal_error', 'document store not ready')
+                r = service.get_job(DOCSTORE, job_id)
+                if r.not_found:
+                    self._logreq(404)
+                    return self.jerr('not_found')
+                return self.j(r)
             self._logreq(404)
             return self.jerr('not_found')
         except Exception:
@@ -244,6 +300,32 @@ class H(BaseHTTPRequestHandler):
             self._logreq(413, 'payload too large')
             return self.jerr('payload_too_large', 'payload too large')
         n = clamp_int(raw_len or 0, 0, 0, 10 * 1024 * 1024)
+
+        # ---- PDF 上传（multipart/form-data）----
+        # 必须**先读原始字节**再判类型：JSON 分支要 dict，multipart 分支要 bytes。
+        # 与 api.py 共用 app/multipart.py，保证两端解析出同一个文件名与同一份字节。
+        ctype = self.headers.get('Content-Type') or ''
+        if p == '/api/v1/documents':
+            if DOCSTORE is None:
+                self._logreq(503, 'document store not ready')
+                return self.jerr('internal_error', 'document store not ready')
+            raw = self.rfile.read(n) if n else b''
+            try:
+                parts = multipart.parse_multipart(raw, ctype)
+            except multipart.MultipartError as exc:
+                self._logreq(400, 'invalid multipart')
+                return self.jerr('invalid_param', 'invalid multipart: %s' % exc)
+            part = multipart.first_file(parts)
+            if part is None:
+                self._logreq(400, 'no file part')
+                return self.jerr('invalid_param', 'no file part in multipart body')
+            r = service.create_document(DOCSTORE, part.filename, part.data)
+            if not r.ok:
+                self._logreq(400, r.reason)
+                return self.jerr('invalid_param', r.reason)
+            # **202**：已受理，解析在后台进行。调用方拿 job.id 轮询。
+            return self.j(r, 202)
+
         try:
             body = json.loads(self.rfile.read(n) or b'{}')
             if not isinstance(body, dict):
@@ -270,9 +352,38 @@ class H(BaseHTTPRequestHandler):
             self._logreq(500, 'internal_error')
             return self.jerr('internal_error', 'internal error')
 
+    def do_DELETE(self):
+        """DELETE /api/v1/documents/{id} —— 删除文档（级联）。
+
+        server.py 原来只有 GET/POST，这组端点是 M3.3 新增的。
+        """
+        self._ctx()
+        if not self._guard():
+            self._logreq(403, 'forbidden')
+            return self.jerr('forbidden')
+        p = urlparse(self.path).path
+        try:
+            if p.startswith('/api/v1/documents/'):
+                doc_id = p[len('/api/v1/documents/'):].strip('/')
+                if doc_id and '/' not in doc_id:
+                    if DOCSTORE is None:
+                        self._logreq(503, 'document store not ready')
+                        return self.jerr('internal_error', 'document store not ready')
+                    r = service.delete_document(DOCSTORE, doc_id)
+                    if r.not_found:
+                        self._logreq(404)
+                        return self.jerr('not_found')
+                    return self.j(r)
+            self._logreq(404)
+            return self.jerr('not_found')
+        except Exception:
+            _log_exc()
+            self._logreq(500, 'internal_error')
+            return self.jerr('internal_error', 'internal error')
+
 
 def main() -> int:
-    global STORE, SRV
+    global STORE, SRV, DOCSTORE
     try:
         STORE = Store()
     except Exception:
@@ -283,6 +394,17 @@ def main() -> int:
     _log('mech-qbank 数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'
          % (s['mode'], s['total'], s['cards'], s['answered'], s['due']))
     _log('  来源分级：%s' % s['by_class'])
+    # 文档域：与 api.py 同一份实现（app/docstore.py）。
+    # 启动时把**遗留的** running/queued 标成 interrupted —— 不假装成功。
+    try:
+        DOCSTORE = docstore.DocStore(DATA / 'private' / 'documents', store=STORE)
+        orphans = DOCSTORE.reap_orphans()
+        if orphans:
+            _log('  文档：%d 个任务因上次进程中断被标记为 interrupted' % len(orphans))
+    except Exception:
+        _log_exc()
+        _alert('启动失败：文档存储初始化出错，详见 exe 同目录的 qbank.log')
+        return 1
     srv = None
     ports = [PORT + i for i in range(PORT_SCAN)]      # 上次没关干净时自动换端口，双击就能起
     for port in ports:
