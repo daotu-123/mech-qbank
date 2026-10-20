@@ -23,6 +23,7 @@ import json
 import re
 import shutil
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -58,6 +59,28 @@ def load_api_module():
     return m
 
 
+def scrub_user_state(db: Path):
+    """清掉副本里的用户答题痕迹，只留题库与卡片。
+
+    与 smoke_test.py 同源问题（2026-10-20）：copy2 把真实库的 progress 表连同
+    last_seen 一起带走，checkin()（core.py:710）从 last_seen 聚合，于是真实刷题记录
+    会混进打卡断言。本文件目前只断言日历形状（不硬编码天数），但依赖日期的断言
+    迟早会被同样的漂移打中，且删掉用户痕迹是测试本分。fsrs_state 一并清。
+    """
+    if not db.exists():
+        return
+    con = sqlite3.connect(db)
+    try:
+        for t in ('progress', 'fsrs_state'):
+            try:
+                con.execute('DELETE FROM %s' % t)
+            except sqlite3.OperationalError:
+                pass
+        con.commit()
+    finally:
+        con.close()
+
+
 def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
     """数据指向临时副本；DB/PROGJSON/CKJSON/NOTESJSON 在 core 模块上，两处都要改。"""
     if public:
@@ -65,6 +88,7 @@ def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
     else:
         paths = {'DB': tmp / ('qbank%s.sqlite' % tag)}
         shutil.copy2(ROOT / 'data' / 'qbank.sqlite', paths['DB'])
+        scrub_user_state(paths['DB'])           # 别把真实刷题记录带进断言
     paths.update({'PROGJSON': tmp / ('progress%s.json' % tag),
                   'CKJSON': tmp / ('checkin%s.json' % tag),
                   'NOTESJSON': tmp / ('notes%s.json' % tag)})

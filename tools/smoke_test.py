@@ -16,9 +16,12 @@ mech-qbank 冒烟测试：不依赖浏览器，直接驱动 Store 数据层 + �
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import re
 import shutil
 import socket
+import sqlite3
+import subprocess as sp
 import sys
 import tempfile
 import threading
@@ -50,6 +53,38 @@ def load_server_module():
     return m
 
 
+def scrub_user_state(db: Path):
+    """清掉副本里的用户答题痕迹，只留题库与卡片。
+
+    为什么必须清（2026-10-20 实测修复）：
+    copy2 会把真实库的 progress 表连同 last_seen 一起带走，而 checkin()
+    （core.py:710）正是从 progress.last_seen 聚合打卡天数，于是真实刷题记录会混进
+    打卡断言。smoke_test 的打卡断言是「今天+昨天+前天 = 3」这种按当前日期推算的
+    绝对值，真实记录一旦落在推算出的空隙里就会把它填上：
+        10-19 跑：合成 {19,18,17,15} + 真实 {17,18} → 4 天、streak 3 → 蒙对 ✓
+        10-20 跑：合成 {20,19,18,16} + 真实 {17,18} → 5 天、streak 5 → 失败 ✗（实测 100/3）
+    也就是说 103 这个基线随日期漂移，根本不是稳定线。日期还会继续往后走，
+    所以只能在源头隔离，而不是改断言去迁就。
+
+    只清两张「用户状态」表，questions / cards 一行不动 —— 本文件大量断言依赖真实题目
+    （pick / search / sections / 「找一道实题验判分」），清了就没得测了。
+    fsrs_state 同样清掉：它是 FSRS 记忆状态，属于用户数据，
+    留着会让「首次答对进入 learning」这类断言受真实复习历史影响。
+    """
+    if not db.exists():
+        return
+    con = sqlite3.connect(db)
+    try:
+        for t in ('progress', 'fsrs_state'):
+            try:
+                con.execute('DELETE FROM %s' % t)
+            except sqlite3.OperationalError:
+                pass          # public 副本没有这表（内存库模式），跳过
+        con.commit()
+    finally:
+        con.close()
+
+
 def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
     """把模块的数据指向临时副本，返回隔离的 Store。tag 用于 store 层与 HTTP 层各用一套文件。
 
@@ -61,6 +96,7 @@ def fresh_store(m, tmp: Path, public: bool, tag: str = ''):
     else:
         paths = {'DB': tmp / ('qbank%s.sqlite' % tag)}
         shutil.copy2(ROOT / 'data' / 'qbank.sqlite', paths['DB'])
+        scrub_user_state(paths['DB'])           # 别把真实刷题记录带进断言
     paths.update({'PROGJSON': tmp / ('progress%s.json' % tag),      # 隔离，别写进真实 data/
                   'CKJSON': tmp / ('checkin%s.json' % tag),        # 手动打卡同样隔离
                   'NOTESJSON': tmp / ('notes%s.json' % tag)})      # 题目备注同样隔离
@@ -568,6 +604,159 @@ def http_smoke(m, tmp: Path, public: bool):
         st.con.close()
 
 
+def subprocess_boot_smoke(tmp: Path):
+    """真正起一个子进程跑 main()，轮询端口 → 断言 HTTP 200 → 杀进程。
+
+    为什么必须单独一条（2026-10-20）：
+    本文件原本只用 exec_module 加载 server.py（smoke_test.py:49），从不调 main()，
+    所以 app/server.py:209 因 `from core import *` 跳过下划线名字而抛的 NameError
+    在六项测试全绿的情况下完全看不见。模块能加载 ≠ 进程能起来。
+
+    隔离手法：把 app/ 整个复制到临时「沙箱根」下再起进程。core.py:33 的 ROOT 是
+    `Path(__file__).parent.parent`，随 app/ 的位置走，于是 DATA/WEB/DB 全指向沙箱，
+    真实 data/qbank.sqlite 一个字节都不碰，也不需要改 core.py。
+    """
+    print('\n== 子进程真实启动：%s ==' % '（本项不区分公开/全量模式）')
+    sandbox = tmp / 'boot'
+    (sandbox / 'app').mkdir(parents=True, exist_ok=True)
+    for name in ('core.py', 'server.py', 'api.py'):
+        shutil.copy2(ROOT / 'app' / name, sandbox / 'app' / name)
+    # 沙箱里放一份题库副本：DB 存在才走 sqlite 分支（public 分支缺 PUBJSON 会 SystemExit）
+    (sandbox / 'data').mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / 'data' / 'qbank.sqlite', sandbox / 'data' / 'qbank.sqlite')
+    scrub_user_state(sandbox / 'data' / 'qbank.sqlite')   # 同样别带用户痕迹进来
+    if (ROOT / 'web' / 'dist').is_dir():
+        shutil.copytree(ROOT / 'web' / 'dist', sandbox / 'web' / 'dist', dirs_exist_ok=True)
+
+    # server.py 与 api.py 各测一次：两个都是设计上的启动路径（start.bat 在
+    # fastapi 不可用时回退 server.py），也各自有独立的 main() 与导入写法。
+    for label, script, endpoint, probe in (
+            ('server.py（标准库回退路径）', 'server.py', '/api/stats', True),
+            ('api.py（FastAPI 主路径）', 'api.py', '/api/v1/questions?limit=1', True)):
+        port = free_port()
+        # 清掉代理环境变量：本机若设了 http_proxy，urllib 会把打向 127.0.0.1 的请求
+        # 也发给代理，代理再回 502（实测踩过，表现为"子进程起不来"其实是 502）。
+        # 双击 exe 的真实场景本来就没有代理，清掉反而更贴近生产。
+        env = dict(os.environ, QBANK_NO_BROWSER='1', QBANK_PORT=str(port), QBANK_PORT_SCAN='1')
+        for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'):
+            env.pop(k, None)
+        env['PYTHONIOENCODING'] = 'utf-8'
+        proc, logf = spawn(sandbox, script, env)
+        try:
+            code, body = poll_http(port, endpoint, proc)
+            check('%s 子进程起得来且 %s → 200' % (label, endpoint), code == 200,
+                  'http=%s 输出=%s' % (code, read_log(logf, 400)))
+            if probe and code == 200 and endpoint == '/api/stats':
+                d = json.loads(body.decode('utf-8'))
+                check('  子进程读到题库（total>0）', d.get('total', 0) > 0, str(d)[:120])
+            elif probe and code == 200:
+                d = json.loads(body.decode('utf-8'))
+                check('  子进程组卷接口可用', isinstance(d, dict) and isinstance(d.get('items'), list),
+                      str(d)[:120])
+        finally:
+            kill_proc(proc)
+            close_boot_log(proc, logf)
+
+    # 端口冲突路径：占住端口后再起，应打印告警并干净退出 1（这条路径用 _alert，
+    # 只导 _log/_log_exc 的话这里照样 NameError —— 回归点就在这）
+    port = free_port()
+    blocker = socket.socket()
+    # 不要设 SO_REUSEADDR：Windows 上它允许同端口重复绑定，占用就失效了
+    # （实测踩过 —— 设了之后 server.py 照常启动，这条断言测不到任何东西）。
+    blocker.bind(('127.0.0.1', port))
+    blocker.listen(1)
+    env = dict(os.environ, QBANK_NO_BROWSER='1', QBANK_PORT=str(port), QBANK_PORT_SCAN='1')
+    for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'):
+        env.pop(k, None)
+    env['PYTHONIOENCODING'] = 'utf-8'
+    proc, logf = spawn(sandbox, 'server.py', env)
+    try:
+        rc = proc.wait(timeout=30)
+        out = read_log(logf, 400)
+        check('端口全被占用时干净退出 1（_alert/_log 路径不崩）',
+              rc == 1 and 'NameError' not in out, 'rc=%s 输出=%s' % (rc, out))
+    except sp.TimeoutExpired:
+        check('端口全被占用时干净退出 1（_alert/_log 路径不崩）', False, '进程未退出')
+    finally:
+        kill_proc(proc)
+        close_boot_log(proc, logf)
+        blocker.close()
+
+
+def spawn(sandbox: Path, script: str, env: dict):
+    """起子进程，stdout/stderr 落临时文件而不是 PIPE。
+
+    用 PIPE 有两个死法（2026-10-20 实测踩到，整个 smoke_test 被挂死）：
+      · 写端没人读 → 缓冲区满后子进程阻塞在写上，永不启动完
+      · 失败分支调 proc.stdout.read() → 要等 EOF，而进程还活着 → 永久阻塞
+    落文件就没有这个问题：随时能读当前快照，读完也不会挂。
+    返回 (proc, 已打开的日志文件对象)。
+    """
+    logf = tempfile.NamedTemporaryFile(prefix='qbank-boot-', suffix='.log',
+                                        delete=False)      # 二进制模式：Popen 要的是文件描述符
+    proc = sp.Popen([sys.executable, '-u', str(sandbox / 'app' / script)],
+                    env=env, stdout=logf, stderr=sp.STDOUT, cwd=str(sandbox))
+    proc._boot_log = logf.name          # 挂上去：kill 后由 close_boot_log 清理
+    return proc, logf
+
+
+def close_boot_log(proc, logf):
+    logf.close()
+    try:
+        os.unlink(proc._boot_log)
+    except Exception:
+        pass
+
+
+def read_log(logf, n: int = 300) -> str:
+    """读子进程日志末尾 n 字。读不到就返回 ''，绝不抛。"""
+    try:
+        p = Path(logf.name)
+        return p.read_text(encoding='utf-8', errors='replace')[-n:] if p.exists() else ''
+    except Exception:
+        return ''
+
+
+def free_port() -> int:
+    """要一个当前没人用的端口。返回前先释放，绑定交给子进程（Windows 上
+    不能 SO_REUSEADDR 残留占用，否则子进程 bind 会失败）。"""
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def poll_http(port: int, path: str, proc, tries: int = 80, gap: float = 0.25) -> tuple:
+    """轮询端口直到能拿到 HTTP 响应。子进程秒退（崩溃）时提前放弃并回报 0。
+
+    tries*gap = 20 秒上限；起不来就是失败，绝不无限等。
+    """
+    for _ in range(tries):
+        if proc.poll() is not None:
+            return 0, b''                      # 进程已死，别白等
+        try:
+            req = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path))
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except OSError:
+            _t.sleep(gap)
+    return 0, b''
+
+
+def kill_proc(proc):
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except sp.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
 def main() -> int:
     public = '--public' in sys.argv
     m = load_server_module()
@@ -576,8 +765,11 @@ def main() -> int:
         st = fresh_store(m, tmp, public)
         store_smoke(m, st, public)
         http_smoke(m, tmp, public)
+        # 真正起子进程跑 main()。只跑全量模式一次：它只验证「进程起得来 + 端口通」，
+        # 与 public/full 的数据口径无关，两种模式各跑一遍只是把耗时翻倍。
+        if not public:
+            subprocess_boot_smoke(tmp)
     # 前后端判分/排期一致性（独立工具，node 缺失时返回 2 表示跳过）
-    import subprocess as sp
     r = sp.run([sys.executable, str(ROOT / 'tools' / 'smoke_parity.py')] + (['--public'] if public else []))
     if r.returncode == 1:
         check('前后端判分/排期一致性（smoke_parity）', False, '见上方差异明细')

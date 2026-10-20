@@ -153,6 +153,18 @@ def make_store(server, public: bool):
     else:
         dbcopy = tmp / 'qbank.sqlite'
         shutil.copy2(DB, dbcopy)
+        # 清掉用户答题痕迹（2026-10-20）：排期比对会对哨兵题跑 mark()，真实库的
+        # progress/fsrs_state 属于用户数据，带进来会让差分基线随真实刷题记录漂移。
+        # 与 smoke_test.py / smoke_api.py 同源处理。questions / cards 一行不动。
+        con = sqlite3.connect(dbcopy)
+        for t in ('progress', 'fsrs_state'):
+            try:
+                con.execute('DELETE FROM %s' % t)
+            except sqlite3.OperationalError:
+                pass
+        con.commit()
+        con.close()
+        con = sqlite3.connect(dbcopy)
         con = sqlite3.connect(dbcopy)
         con.executemany(
             'INSERT OR REPLACE INTO questions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
