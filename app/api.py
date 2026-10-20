@@ -28,6 +28,27 @@ import time
 import webbrowser
 from urllib.parse import urlparse
 
+# ---------------------------------------------------------------- 冻结分发（frozen worker 陷阱）
+# PyInstaller 打包后 `sys.executable` 就是 exe 自身，pdf_client 只能用
+#   [sys.executable, '--pdf-worker', IN, OUT]
+# 唤起 worker（不能再拼脚本路径，exe 会把脚本名当普通参数）。
+# 所以**本文件必须识别这个标记**，否则 exe 会无条件走下面的 main() 去启动
+# Web 服务（还可能撞端口），worker 永不执行 → 所有 PDF 解析必然超时。
+#
+# 为什么放在模块最前面（import core / fastapi 之前）：
+#   · worker 路径**不依赖 fastapi**——解析进程不该拖着整个 Web 框架；
+#   · worker 路径**不碰数据层**（core 会建 DATA 目录、连 sqlite），
+#     解析一个 PDF 不该有数据层副作用；
+#   · frozen + --windowed 下 sys.stdout/stderr 是 None，本分支一个字都不
+#     print（结果只走输出文件 + 退出码，与 pdf_worker 的纪律一致）。
+#
+# 非 frozen 同样支持（测试用 `python app/api.py --pdf-worker IN OUT`
+# 模拟 frozen），这样端到端路径不用真打包就能验。
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--pdf-worker':
+    import pdf_worker
+    # pdf_worker.main 接受 `--pdf-worker IN OUT` 形态，会自己剥掉这个标记。
+    sys.exit(pdf_worker.main(sys.argv[1:]))
+
 import core
 # errors 不从 core 传播（core 不依赖它，是反向依赖），所以本文件必须显式导入。
 # errors 是纯标准库模块 —— 两套服务端共用同一套错误格式与 request_id 生成。
