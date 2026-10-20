@@ -415,6 +415,29 @@ words 级五步法（已实测验证）：
 - 进程启动开销约 0.2–0.3s（含 `import pymupdf`）。
 - 需要处理 worker 超时、崩溃、僵尸进程回收，代码量比在主进程里调库多。
 
+**已实施（提交 `fdc8288`）**：`app/pdf_worker.py` + `app/pdf_client.py` + 31 项测试。
+
+| 项 | 实测/实现 |
+|---|---|
+| 协议 | 全程临时文件，**Popen 不传 stdout/stderr**（传 PIPE 会双死），判定只靠退出码 + 输出文件 |
+| 超时 | 默认 60s，超时 kill + wait 回收 → `status='timeout'` / `code='parse_timeout'` |
+| 崩溃 | 退出码非 0 / 无输出 / 输出非 JSON / 协议版本不符 → `status='worker_crashed'`，**日志记退出码** |
+| 崩溃隔离实测 | 真实 `os.abort()`（退出码 3221226505 = 0xC0000409）后调用方 pid 不变，随后调用全部正常 |
+| 并发 | 锁**非阻塞**获取，拿不到立刻 `busy`，不排队（一个坏 PDF 不该拖住后续请求） |
+| frozen 分支 | `worker_command()` 纯函数，frozen `[exe,'--pdf-worker',IN,OUT]` / 非 frozen `[exe,脚本,IN,OUT]`，两条都有测试 |
+| client 纯净 | 不 import `pymupdf`、**也不 import `pdf_extract`**（后者会拖进 pymupdf） |
+
+> **实测修正一处**：进程启动开销不是 0.2–0.3s。实测**端到端 2.2–3.1s**，
+> 其中 `import pymupdf` 冷启动就要 **2.0s**。这对 UX 有影响（M3.3 接 HTTP 时
+> 要考虑给「正在解析」的反馈），但对 worker 化的结论没有影响。
+
+> ⚠️ **硬内存上限（Windows Job Objects）本步未实现**，不要当成已有能力。
+> 现状兜底是三层：**超时（60s）+ 串行（并发 1）+ 进程隔离（崩溃不波及调用方）**。
+> worker 真吃到 GB 级会被 OS 提交限制/OOM 收拾掉，最坏情况是该 worker 进程消失、
+> 调用方返回 `worker_crashed`——**Web 进程仍然活着**。所以缺硬上限不危及服务，
+> 只是「失控 worker 可能短暂多占内存」。将来要补必须自带测试，
+> 且不能只在 Windows 上生效（ctypes 绑 `kernel32`/`psapi` + 跨平台退化路径）。
+
 ---
 
 ### 【G】三类边界（按 owner 已定口径落实）
