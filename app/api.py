@@ -24,10 +24,14 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 import webbrowser
 from urllib.parse import urlparse
 
 import core
+# errors 不从 core 传播（core 不依赖它，是反向依赖），所以本文件必须显式导入。
+# errors 是纯标准库模块 —— 两套服务端共用同一套错误格式与 request_id 生成。
+import errors
 # service 不从 core 传播（core 不依赖它，是反向依赖），所以本文件必须显式导入。
 # 注意 service 是纯标准库模块 —— 它不认识 fastapi，这样零依赖回退的 server.py
 # 也能 import 它，两套服务端共享同一份业务用例。
@@ -36,6 +40,7 @@ from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log
                   clamp_int)
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -44,6 +49,9 @@ from typing import Literal, Optional
 
 app = FastAPI(title='mech-qbank', version='2.0', docs_url=None, redoc_url=None,
               openapi_url=None)          # 本机自用工具，不开 Swagger 减少攻击面
+# 请求体上限 10 MB：与 server.py 的 clamp_int(..., 0, 10*1024*1024) 同口径。
+# 公网化后反代也应有同等限制，这一层是应用侧的兜底。
+MAX_BODY_BYTES = 10 * 1024 * 1024
 STORE: Optional[Store] = None
 SRV = None            # uvicorn.Server 实例，供 /api/v1/system/shutdown 用
 
@@ -65,6 +73,23 @@ SRV = None            # uvicorn.Server 实例，供 /api/v1/system/shutdown 用
 #   · 令牌卫生三通道（docs §0.4）：日志不得出现明文凭据、令牌不进 URL、Referrer-Policy
 #   · 现有 Host/Origin 守卫保留，二者并存
 AUTH_ENABLED = False
+
+
+@app.middleware('http')
+async def limit_body(request: Request, call_next):
+    """超大请求体 → 413（统一格式）。
+
+    必须**只看 Content-Length 头**就拒绝，不能等把 body 读完：
+    一个 1 GB 的 POST 会先把 1 GB 灌进内存/磁盘才谈得上判断。
+    声明缺失时按 0 处理（chunked 传输本机场景不用管）。
+
+    上限 10 MB，与 server.py 的 clamp_int 口径一致。
+    """
+    raw = request.headers.get('content-length') or ''
+    if raw.isdigit() and int(raw) > MAX_BODY_BYTES:
+        errors.log_line(core._log, 413, request.method, request.url.path, code='payload_too_large')
+        return _err('payload_too_large', 'payload too large', request=request)
+    return await call_next(request)
 
 
 @app.middleware('http')
@@ -95,11 +120,46 @@ async def guard(request: Request, call_next):
     """
     host = (request.headers.get('host') or '').split(':')[0].strip()
     if host not in ALLOWED_HOSTS:
-        return JSONResponse({'detail': 'forbidden'}, status_code=403)
+        errors.log_line(core._log, 403, request.method, request.url.path, code='forbidden')
+        return _err('forbidden', 'forbidden')
     origin = request.headers.get('origin')
     if origin and (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
-        return JSONResponse({'detail': 'forbidden'}, status_code=403)
+        errors.log_line(core._log, 403, request.method, request.url.path, code='forbidden')
+        return _err('forbidden', 'forbidden')
     return await call_next(request)
+
+
+# ---------------------------------------------------------------- 请求追踪（request_id + 访问日志）
+# ⚠️ 本装饰器必须写在 auth 与 guard **之后**（即文件里更靠下）。
+# FastAPI/Starlette 是**后注册先执行**（实测见 guard 的 docstring），
+# 所以「写在后面」= 最后注册 = **最先跑** = 最外层。
+# 必须最外层才能保证：
+#   · 每个请求都拿到 request_id（哪怕随后被 guard 以 403 拒绝）
+#   · 记录的是最终状态码与完整耗时（含被拒的请求）
+#   · 异常处理器与服务层能拿到同一个 id
+#
+# request_id 同时写两处，缺一不可：
+#   · contextvar（errors 模块）—— 供 **service 层**与结构化日志用
+#   · request.state       —— 供 **异常处理器**用。原因：Starlette 的异常处理跑在
+#     ExceptionMiddleware 里，**不在 BaseHTTPMiddleware 的 contextvar 作用域内**，
+#     只靠 contextvar 会读空值（实测：异常处理器拿到的 rid 是空串，
+#     导致 X-Request-Id 头整个缺失）。
+@app.middleware('http')
+async def request_context(request: Request, call_next):
+    rid = errors.new_request_id()
+    errors.set_request_id(rid)
+    errors.mark_start(time.time())
+    request.state.request_id = rid          # 给异常处理器 / 端点用，跨中间件边界可靠
+    try:
+        response = await call_next(request)
+    except Exception:
+        errors.log_line(core._log, 500, request.method, request.url.path,
+                        code='internal_error')
+        raise
+    # 响应头也带一份：排障时浏览器 Network 面板就能看到，不用翻响应体
+    response.headers['X-Request-Id'] = rid
+    errors.log_line(core._log, response.status_code, request.method, request.url.path)
+    return response
 
 
 # 开发时前端跑 vite dev server（localhost:5173），跨域打本服务需要 CORS 响应头；
@@ -116,9 +176,11 @@ def _404():
 def _raise4xx(r):
     """把 service.Result 里的中性错误翻译成 HTTP 异常。
 
-    这是**业务语义 → HTTP 状态码的唯一转换点**。
-    service 层不认识 HTTP（它不能 import fastapi，否则零依赖回退路径当场失效），
-    所以它只能返回 reason='not found'；翻译成404 还是 400 由本层决定。
+    这是**业务语义 → HTTP 状态码的唯一转换点**，且必须留在 service 边界之外 ——
+    service.py 只返回 Result(ok=False, reason='not found')，不认识 HTTP
+    （它不能 import fastapi，否则零依赖回退路径当场失效）。
+    响应体的组装不在这里做：统一由 app/errors.py + 下面的异常处理器完成，
+    这样 FastAPI 侧与标准库侧的 body 结构才能保证完全一致。
 
     将来加鉴权（W3，见 docs/architecture-baseline.md §0.2）时，
     「未登录 → 401」也是在这里或它上面那层做，不要散进各个端点。
@@ -128,6 +190,75 @@ def _raise4xx(r):
     if r.get('error'):
         raise HTTPException(400, r['error'])
     return r
+
+
+def _rid_of(request=None) -> str:
+    """取当前请求的 id。
+
+    先看 request.state（异常处理器跑在 contextvar 作用域之外，只能靠它），
+    再退回 contextvar（service 层与结构化日志走这条）。
+    两者由 request_context 中间件同时写入，值必然一致。
+    """
+    try:
+        rid = getattr(request.state, 'request_id', '') if request is not None else ''
+    except Exception:
+        rid = ''
+    return rid or errors.current_request_id()
+
+
+def _err(code_name, message, status=None, request=None):
+    """统一错误响应的唯一构造出口。
+
+    三件事在这里一次做完，保证任何来源的错误都带齐三样：
+      1. 统一 body（errors.error_body）
+      2. X-Request-Id 响应头（异常处理器跑在 request_context 中间件**之外**，
+         所以不能指望 request_context 补这个头 —— 必须各自带上）
+      3. 结构化日志一行
+    """
+    rid = _rid_of(request)
+    resp = JSONResponse(status_code=status or errors.CODE_STATUS.get(code_name, 500),
+                        content=errors.error_body(code_name, message, rid))
+    if rid:
+        resp.headers['X-Request-Id'] = rid
+    return resp
+
+
+# ---------------------------------------------------------------- 统一错误响应
+# 五类来源归一到同一个 body：{"error":{"code","message","request_id"}}
+@app.exception_handler(HTTPException)
+async def _http_exc(request: Request, exc: HTTPException):
+    code = {404: 'not_found', 403: 'forbidden', 401: 'unauthorized',
+            413: 'payload_too_large', 415: 'unsupported_type',
+            422: 'invalid_param'}.get(exc.status_code, 'invalid_param')
+    return _err(code, str(exc.detail), status=exc.status_code, request=request)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exc(request: Request, exc: RequestValidationError):
+    """FastAPI 的入参校验失败（422）也走统一格式，不再吐FastAPI 原生的detail 数组。
+
+    只取第一条错误的 msg：原生数组结构复杂且不稳定，前端不该依赖它。
+    """
+    detail = ''
+    try:
+        errs = exc.errors()
+        if errs:
+            detail = str(errs[0].get('msg') or '').replace('Value error, ', '')
+    except Exception:
+        pass
+    return _err('invalid_param', detail, status=422, request=request)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exc(request: Request, exc: Exception):
+    """兜底：任何未捕获异常都回 500，且**不回显异常原文**。
+
+    原文可能含库路径与 SQL（core.py 已有同口径的安全基线，§8-b），一律只进日志。
+    """
+    core._log_exc()
+    errors.log_line(core._log, 500, request.method, request.url.path,
+                    code='internal_error')
+    return _err('internal_error', 'internal error', request=request)
 
 
 # ---------------------------------------------------------------- 请求体
@@ -271,6 +402,38 @@ def mark(qid: str, body: MarkIn):
 @app.get('/api/v1/wrong')
 def wrong(limit: int = 200):
     return {'items': STORE.wrong_list(limit)}
+
+
+# ---------------------------------------------------------------- 健康检查
+# 放在 /api/v1 之外：健康检查是基础设施接口，不是业务 API。
+# 两套服务端都要有等价行为（app/server.py 的 /health/* 见对应实现）。
+@app.get('/health/live')
+def health_live():
+    """存活探针：**只表示进程活着**，不碰数据层。
+
+    刻意不查数据库：数据层出问题应该由 /health/ready 报出来，
+    而不是让编排器把一个「数据暂时不可用」的服务重启一遍 ——
+    重启解决不了磁盘/权限问题，只会掩盖它。
+    """
+    return {'status': 'ok'}
+
+
+@app.get('/health/ready')
+def health_ready():
+    """就绪探针：**真的去读数据层**。不可用时返回 503 而不是 200。
+
+    只做一次极轻量的读（COUNT 1），不跑 stats() 这类重查询——
+    健康检查会按秒级频率打，跑重查询等于自己制造负载。
+    """
+    try:
+        row = STORE.q('SELECT 1 AS ok')
+        if not row or row[0][0] != 1:
+            raise RuntimeError('unexpected probe result')
+        return {'status': 'ready'}
+    except Exception:
+        _log_exc()
+        errors.log_line(core._log, 503, 'GET', '/health/ready', code='internal_error')
+        return _err('internal_error', 'data layer unavailable', status=503)
 
 
 # ---------------------------------------------------------------- 统计与元数据

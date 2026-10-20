@@ -46,7 +46,9 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import core                                          # 数据层单例（STORE/SRV/路径常量都在它上面）
+import errors                                       # 统一错误格式 + request_id（纯标准库，与 api.py 同一份）
 import service                                       # 业务用例（纯标准库；与 api.py 共享同一份）
+import time                                          # request_context 用它计时
 from core import *                                   # noqa: F401,F403 数据层与常量
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
 # 关键：上面的 `import *` **会跳过下划线开头的名字**，而本文件用到 _log/_log_exc/_alert，
@@ -102,6 +104,11 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        # 与 api.py 一致：request_id 同时出现在响应头与响应体，
+        # 排障时看浏览器 Network 面板就能与日志对上，不用翻 body。
+        rid = errors.current_request_id()
+        if rid:
+            self.send_header('X-Request-Id', rid)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -109,13 +116,51 @@ class H(BaseHTTPRequestHandler):
     def j(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode('utf-8'))
 
+    def jerr(self, code_name, message=''):
+        """统一错误响应，与 api.py 的 errors.error_body() 完全同结构。
+
+        本文件是**零依赖回退服务端**，所以错误格式必须用纯标准库实现；
+        但结构与 FastAPI 侧共用 app/errors.py 的同一个函数，因此天然一致。
+        """
+        status = errors.CODE_STATUS.get(code_name, 500)
+        return self.j(errors.error_body(code_name, message, errors.current_request_id()), status)
+
+    def _ctx(self):
+        """每个请求进入时调用：生成 request_id 并开始计时。"""
+        rid = errors.new_request_id()
+        errors.set_request_id(rid)
+        errors.mark_start(time.time())
+        return rid
+
+    def _logreq(self, status, note=''):
+        """结构化访问日志：request_id / method / path / status / ms。"""
+        u = urlparse(self.path)
+        errors.log_line(_log, status, self.command, u.path, note=note)
+
     def do_GET(self):
+        self._ctx()
         if not self._guard():
-            return self.j({'error': 'forbidden'}, 403)
+            self._logreq(403, 'forbidden')
+            return self.jerr('forbidden')
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         p = u.path
         try:
+            # 健康检查与 api.py 等价：live 不碰数据层，ready 真的读一次
+            if p == '/health/live':
+                self._logreq(200)
+                return self.j({'status': 'ok'})
+            if p == '/health/ready':
+                try:
+                    row = STORE.q('SELECT 1 AS ok')
+                    if not row or row[0][0] != 1:
+                        raise RuntimeError('unexpected probe result')
+                    self._logreq(200)
+                    return self.j({'status': 'ready'})
+                except Exception:
+                    _log_exc()
+                    self._logreq(503, 'data layer unavailable')
+                    return self.jerr('internal_error', 'data layer unavailable')
             if p in ('/', '/index.html'):
                 return self._send(200, (WEB / 'index.html').read_bytes(), 'text/html; charset=utf-8')
             if p == '/favicon.ico':
@@ -125,7 +170,8 @@ class H(BaseHTTPRequestHandler):
                 if f.is_file() and WEB.resolve() in f.parents:   # is_file：目录/不存在都挡掉
                     return self._send(200, f.read_bytes(),
                                       mimetypes.guess_type(str(f))[0] or 'application/octet-stream')
-                return self.j({'error': 'not found'}, 404)
+                self._logreq(404)
+                return self.jerr('not_found')
             if p == '/api/stats':
                 return self.j(STORE.stats())
             if p == '/api/quiz':
@@ -178,16 +224,26 @@ class H(BaseHTTPRequestHandler):
                         pass
                 threading.Thread(target=_stop, daemon=True).start()
                 return self.j({'ok': True})
-            return self.j({'error': 'not found'}, 404)
+            self._logreq(404)
+            return self.jerr('not_found')
         except Exception:
             _log_exc()                       # 只进控制台/日志，别把异常原文（含库路径/SQL）回给客户端
-            return self.j({'error': 'internal error'}, 500)
+            self._logreq(500, 'internal_error')
+            return self.jerr('internal_error', 'internal error')
 
     def do_POST(self):
+        self._ctx()
         if not self._guard():
-            return self.j({'error': 'forbidden'}, 403)
+            self._logreq(403, 'forbidden')
+            return self.jerr('forbidden')
         p = urlparse(self.path).path
-        n = clamp_int(self.headers.get('Content-Length') or 0, 0, 0, 10 * 1024 * 1024)
+        # Content-Length 超过上限 → 413（统一格式），不读 body 也不进业务逻辑。
+        # 上限 10 MB 与重构前一致；api.py 侧由 uvicorn/Starlette 同样按此语义处理。
+        raw_len = self.headers.get('Content-Length')
+        if raw_len and raw_len.isdigit() and int(raw_len) > 10 * 1024 * 1024:
+            self._logreq(413, 'payload too large')
+            return self.jerr('payload_too_large', 'payload too large')
+        n = clamp_int(raw_len or 0, 0, 0, 10 * 1024 * 1024)
         try:
             body = json.loads(self.rfile.read(n) or b'{}')
             if not isinstance(body, dict):
@@ -207,10 +263,12 @@ class H(BaseHTTPRequestHandler):
                 return self.j(STORE.manual_checkin())
             if p == '/api/notes':
                 return self.j(STORE.set_note(str(body.get('id', '')), str(body.get('note', ''))))
-            return self.j({'error': 'not found'}, 404)
+            self._logreq(404)
+            return self.jerr('not_found')
         except Exception:
             _log_exc()
-            return self.j({'error': 'internal error'}, 500)
+            self._logreq(500, 'internal_error')
+            return self.jerr('internal_error', 'internal error')
 
 
 def main() -> int:

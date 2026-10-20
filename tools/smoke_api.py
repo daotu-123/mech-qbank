@@ -192,6 +192,19 @@ def api_smoke(m, public: bool):
     def jget(path, headers=None):
         return req('GET', path, headers=headers)
 
+    def _raw_get(url):
+        """打完整 URL（不带 /api/v1 前缀）。给 /health/* 这类根路径端点用。"""
+        try:
+            with urlopen(urllib.request.Request(url), timeout=10) as resp:
+                body = resp.read()
+                return resp.status, (json.loads(body.decode('utf-8')) if body else {}), dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            try:
+                return e.code, json.loads(body.decode('utf-8')), dict(e.headers)
+            except Exception:
+                return e.code, {}, dict(e.headers)
+
     try:
         code, d, _ = jget('/stats')
         check('GET /stats', code == 200 and d.get('total', 0) > 0 and 'by_type' in d, d)
@@ -325,7 +338,12 @@ def api_smoke(m, public: bool):
         check('POST /checkins 手动补签', code == 200 and d.get('checked_today') is True, d)
 
         code, d, h = jget('/stats', headers={'Host': 'evil.com'})
-        check('Host 白名单：evil.com → 403', code == 403 and d.get('detail') == 'forbidden', (code, d))
+        # 2026-10-20 起错误响应统一为 {"error":{"code","message","request_id"}}，
+        # 不再是 FastAPI 原生的 {"detail": "..."}。
+        err = (d or {}).get('error') or {}
+        check('Host 白名单：evil.com → 403 且走统一错误格式',
+              code == 403 and err.get('code') == 'forbidden' and bool(err.get('request_id')),
+              (code, d))
         code, d, h = jget('/stats', headers={'Origin': 'http://evil.com'})
         check('Origin 白名单：evil.com → 403', code == 403, code)
         # vite dev server（localhost:5173）跨域打本服务的放行规则
@@ -357,6 +375,69 @@ def api_smoke(m, public: bool):
                 check('GET /assets/index-*.js → 200', False, repr(e)[:80])
         else:
             print('  - 跳过：web/dist 不存在（先 npm run build）')
+
+        # ---- 健康检查（2026-10-20 第3 部分）----
+        # 注意：/health/* 在 /api/v1 **之外**（健康检查是基础设施接口，不是业务 API），
+        # 所以不能用 jget（它会自动带上 /api/v1 前缀），要打完整 base。
+        root = 'http://127.0.0.1:%d' % port
+        code, d, h = _raw_get(root + '/health/live')
+        check('GET /health/live → 200 且不碰数据层', code == 200 and d.get('status') == 'ok', (code, d))
+        code, d, h = _raw_get(root + '/health/ready')
+        check('GET /health/ready → 200（数据层可读）', code == 200 and d.get('status') == 'ready', (code, d))
+
+        # ---- 统一错误格式（2026-10-20 第 3 部分）----
+        # 契约：{"error": {"code": "...", "message": "...", "request_id": "..."}}
+        # code 是稳定英文标识，前端靠它分支，不要去匹配 message。
+        CODES = ('invalid_param', 'not_found', 'unauthorized', 'forbidden',
+                 'internal_error', 'payload_too_large', 'unsupported_type')
+
+        def err_shape(body):
+            e = (body or {}).get('error')
+            return e if isinstance(e, dict) else None
+
+        code, d, h = jget('/questions?level=abc')
+        e = err_shape(d)
+        check('坏参数 → 422 且 code=invalid_param',
+              code == 422 and e and e.get('code') == 'invalid_param', (code, d))
+        check('错误体含 message 与 request_id',
+              e and isinstance(e.get('message'), str) and bool(e.get('request_id')), e)
+
+        code, d, h = req('POST', '/questions/NOSUCH/grade', {'given': 'A'})
+        e = err_shape(d)
+        check('不存在资源 → 404 且 code=not_found',
+              code == 404 and e and e.get('code') == 'not_found', (code, d))
+
+        # request_id 必须在响应头与响应体里一致 —— 这是把用户看到的响应与日志对上的唯一线索
+        rid_body = (err_shape(d) or {}).get('request_id')
+        rid_hdr = {k.lower(): v for k, v in (h or {}).items()}.get('x-request-id')
+        check('request_id 在响应头与响应体一致',
+              bool(rid_body) and rid_hdr == rid_body, (rid_hdr, rid_body))
+
+        code, d, h = jget('/stats', headers={'Host': 'evil.com'})
+        e = err_shape(d)
+        check('guard 403 也走统一格式（code=forbidden）',
+              code == 403 and e and e.get('code') == 'forbidden', (code, d))
+
+        # 超大payload：只发 Content-Length 头会被服务端在读 body 前拒掉；
+        # 真发 11 MB 时客户端可能先收到连接中止，所以断言只看「要么 413 要么连不上」，
+        # 但要求服务端日志里确实记了 413（说明判定发生过）。
+        big = json.dumps({'progress': {'x': 'y' * (11 * 1024 * 1024)}}).encode('utf-8')
+        try:
+            rq = urllib.request.Request(base + '/progress', data=big,
+                                        headers={'Content-Type': 'application/json'}, method='POST')
+            with urlopen(rq, timeout=30) as resp:
+                got = resp.status
+        except urllib.error.HTTPError as ex:
+            got = ex.code
+        except Exception:
+            got = None            # 连接被中止也算服务端已拒绝
+        check('超大 payload 被拒（413 或连接中止，绝不是 200）', got in (413, None), got)
+
+        # 错误码表本身要对齐（新增 code 时两边不能只改一处）
+        errs_mod = sys.modules.get('errors')
+        check('errors.CODE_STATUS 覆盖契约里的 7 个 code',
+              errs_mod is not None and all(c in errs_mod.CODE_STATUS for c in CODES),
+              sorted(errs_mod.CODE_STATUS) if errs_mod else None)
 
         code, d, _ = req('POST', '/system/shutdown')
         check('POST /system/shutdown', code == 200 and d.get('ok') is True, d)
