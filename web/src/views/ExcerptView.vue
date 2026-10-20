@@ -16,13 +16,23 @@
         <b>PDF 摘录 → 挖空 / 判断题</b>
         <span class="sub">从 PDF 复制文本粘贴到下面，或把 .txt / .md 拖进来</span>
       </div>
+
+      <!-- 来源引用：从「PDF 文档」某一页「用此页做摘录」跳过来时显示。
+           引用跟段落走 —— 每段都能看到自己出自哪份文件哪一页，存成题后仍可追。 -->
+      <div v-if="seed" class="seed">
+        <b>来自文档</b>
+        <span class="meta">{{ seed.docName }} · 第 {{ seed.printedLabel }} 页
+          （{{ seed.chars }} 字{{ seed.page !== seed.printedLabel ? '，物理第 ' + seed.page + ' 页' : '' }}）</span>
+        <button class="ghost" style="margin-left:auto;flex:none" @click="clearSeed">清除引用</button>
+      </div>
+
       <div style="margin-top:10px" @dragover.prevent @drop.prevent="onDrop">
         <el-input v-model="raw" type="textarea" :rows="6"
                   placeholder="在这里粘贴从 PDF 复制的文本…（支持整段粘贴，按空行或单行拆段）" />
       </div>
       <div class="row" style="margin-top:10px">
         <button class="act" @click="split">拆成段落</button>
-        <button class="ghost" @click="raw = ''">清空</button>
+        <button class="ghost" @click="clearRaw">清空</button>
         <span class="meta">拆段规则：优先按空行，没有空行时按单行</span>
       </div>
     </div>
@@ -38,6 +48,7 @@
     <div v-for="p in paras" :key="p.pid" class="card">
       <div class="row">
         <span class="pill gray">第 {{ p.pid + 1 }} 段</span>
+        <span v-if="seed" class="pill blue">{{ seed.docName }} p.{{ seed.printedLabel }}</span>
         <span v-if="p.savedId" class="pill green">已存 {{ p.savedId }}</span>
         <span class="pill amber" v-if="p.mode === 'judge'">判断</span>
         <span class="pill amber" v-else-if="p.answers.length">{{ p.answers.length }} 个空</span>
@@ -99,7 +110,12 @@ import { bump } from '@/store/bus'
 const raw = ref('')
 const paras = ref([])
 const customItems = ref([])
+/** 来源引用：{docId, docName, page, printedLabel, chars}，由「PDF 文档」页写入 sessionStorage */
+const seed = ref(null)
 const BANK = 'PDF 自建'
+
+/** sessionStorage 里预填文本的键。与 DocumentsView.sendToExcerpt 对应。 */
+const SEED_KEY = 'qbank.excerptSeed'
 
 const today = computed(() => {
   const d = new Date(), p = (n) => String(n).padStart(2, '0');
@@ -213,7 +229,10 @@ function nextId() {
 function buildQ(p) {
   const base = {
     id: nextId(), level: 1, bank: BANK,
-    section_path: 'PDF 摘录 · ' + today.value,
+    // 有来源就把来源写进章节路径：日后看到题目能追回「这是哪份 PDF 第几页」。
+    section_path: seed.value
+      ? 'PDF 摘录 · ' + seed.value.docName + ' p.' + seed.value.printedLabel
+      : 'PDF 摘录 · ' + today.value,
     explanation: (p.expl || '').trim(),
   };
   if (p.mode === 'judge') {
@@ -255,7 +274,45 @@ async function removeOne(id) {
   if (r && r.ok) { ElMessage.success('已删除 ' + id); await loadCustom(); bump(); }
 }
 
-onMounted(loadCustom);
+/** 清空文本时顺手清掉来源引用 —— 否则会挂着一个对不上内容的引用，
+ *  存进题库后题解里的来源就是错的（比没有来源更糟）。 */
+function clearRaw() {
+  raw.value = '';
+  clearSeed();
+}
+function clearSeed() {
+  seed.value = null;
+  try { sessionStorage.removeItem(SEED_KEY); } catch (e) { /* 隐私模式 */ }
+}
+
+/**
+ * 读来源引用并预填。**一次读完就清掉 sessionStorage**：
+ * 留着的话，用户刷新一下就会重复预填一次，把刚才手工改的内容冲掉。
+ */
+function consumeSeed() {
+  let box = null;
+  try { box = JSON.parse(sessionStorage.getItem(SEED_KEY) || 'null'); }
+  catch (e) { box = null; }
+  if (!box || !box.text) return;
+  try { sessionStorage.removeItem(SEED_KEY); } catch (e) { /* 隐私模式 */ }
+  seed.value = {
+    docId: box.docId || '', docName: box.docName || '未命名文档',
+    page: box.page || 1, printedLabel: box.printedLabel || box.page || 1,
+    chars: box.chars || (box.text || '').length,
+  };
+  raw.value = box.text;
+  // 直接拆段：用户点「用此页做摘录」的意图是"开始做"，停在原始文本里多一步点击。
+  const txt = (box.text || '').replace(/\r\n/g, '\n').trim();
+  let blocks = txt.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
+  if (blocks.length <= 1) blocks = txt.split('\n').map((x) => x.trim()).filter(Boolean);
+  paras.value = blocks.map((text, i) => ({
+    pid: i, text, answers: [], sel: null, mode: 'fill', truth: '对', expl: '', savedId: '',
+  }));
+  ElMessage.success('已预填「' + seed.value.docName + '」第 ' + seed.value.printedLabel
+    + ' 页，共 ' + blocks.length + ' 段');
+}
+
+onMounted(() => { consumeSeed(); loadCustom(); });
 </script>
 
 <style scoped>
@@ -272,4 +329,13 @@ onMounted(loadCustom);
   user-select: text;
 }
 .para-text::selection { background: #ffe9b8; }
+.seed {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 10px; padding: 9px 12px;
+  background: var(--steel-weak); color: var(--steel-deep);
+  border-radius: 8px; font-size: 13.5px;
+}
+@media (max-width: 480px) {
+  .seed { padding: 8px 10px; font-size: 13px; }
+}
 </style>

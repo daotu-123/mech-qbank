@@ -7,6 +7,7 @@ import WrongView from '@/views/WrongView.vue'
 import CardsView from '@/views/CardsView.vue'
 import StatsView from '@/views/StatsView.vue'
 import ExcerptView from '@/views/ExcerptView.vue'
+import DocumentsView from '@/views/DocumentsView.vue'
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -20,6 +21,8 @@ const router = createRouter({
     { path: '/cards', name: 'cards', component: CardsView },
     { path: '/stats', name: 'stats', component: StatsView },
     { path: '/excerpt', name: 'excerpt', component: ExcerptView },
+    // PDF 文档（服务端解析，file:// 下整块不可用——路由仍在，页面里说清为什么）
+    { path: '/documents', name: 'documents', component: DocumentsView },
   ],
   scrollBehavior() { return { top: 0 }; }
 });

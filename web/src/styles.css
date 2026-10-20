@@ -62,6 +62,8 @@ button.ghost:disabled{opacity:.5;cursor:not-allowed}
 .pill.red{background:var(--bad-weak);color:var(--bad)}
 .pill.green{background:var(--ok-weak);color:var(--ok)}
 .pill.amber{background:var(--amber-weak);color:#92580a}
+.pill.blue{background:var(--steel-weak);color:var(--steel-deep);max-width:100%;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ---- 组卷条件 chips ---- */
 .cond-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px;
