@@ -385,6 +385,36 @@ def api_smoke(m, public: bool):
         code, d, h = _raw_get(root + '/health/ready')
         check('GET /health/ready → 200（数据层可读）', code == 200 and d.get('status') == 'ready', (code, d))
 
+        # ---- 数据层不可用时的 ready=503（受控注入，不碰真实库）----
+        # 为什么必须一起测 live：/health/live「只表示进程活着、不查数据库」是一个
+        # 设计约定，不是实现细节。单独测 ready=503 时，live 退化成也去查数据库
+        # 也能让这两条都变绿 —— 所以必须同时断言 live 仍 200。
+        class _DeadStore:
+            """读操作必抛的死桩，模拟库被删 / 锁住 / 权限丢失。"""
+            mode = 'sqlite'
+            def q(self, sql, args=()):
+                raise sqlite3.OperationalError('unable to open database file')
+        saved = m.STORE
+        try:
+            m.STORE = _DeadStore()
+            code, d, h = _raw_get(root + '/health/live')
+            check('数据层不可用时 /health/live 仍 200（刻意不查数据库）',
+                  code == 200 and d.get('status') == 'ok', (code, d))
+            code, d, h = _raw_get(root + '/health/ready')
+            e = (d or {}).get('error')
+            check('数据层不可用时 /health/ready → 503 且 code=internal_error',
+                  code == 503 and isinstance(e, dict) and e.get('code') == 'internal_error',
+                  (code, d))
+            check('ready 503 的错误体含 message 与 request_id',
+                  isinstance(e, dict) and isinstance(e.get('message'), str)
+                  and bool(e.get('request_id')), e)
+        finally:
+            m.STORE = saved          # 断言抛异常也必须恢复，否则污染后续测试
+        # 恢复后自检：确认 STORE 真的换回来了（这条能抓住 finally 被跳过的情况）
+        code, d, _ = _raw_get(root + '/health/ready')
+        check('恢复 STORE 后 /health/ready 回到 200', code == 200 and d.get('status') == 'ready',
+              (code, d))
+
         # ---- 统一错误格式（2026-10-20 第 3 部分）----
         # 契约：{"error": {"code": "...", "message": "...", "request_id": "..."}}
         # code 是稳定英文标识，前端靠它分支，不要去匹配 message。
