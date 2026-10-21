@@ -30,11 +30,18 @@
 
 三个维度正交，任意组合都成立。本项目选定的组合是「并行 + 公网单用户 + 单账号」。
 
-### 0.2 部署形态：公网单用户（owner 决定，尚未实施）
+### 0.2 部署形态：公网单用户（owner 决定；**代码侧已实施，待真部署**）
 
 **目标态**：一台 VPS + 一个域名 + TLS 终止，owner 自用。
 
-**代码现状（这是要被改掉的对象，不是授权范围）**：
+> **状态说明（2026-10-21）**：W1–W4 的**代码**已实施并通过测试（见下方工作块表），
+> 打包产物也逐条验过（§9.4）。**但真部署尚未做** —— 需要 owner 的 VPS、域名与 TLS。
+> 部署前要准备什么见 `docs/deploy-checklist.md`，怎么配见 `docs/public-deploy.md`。
+>
+> 下面这张「代码现状」表记录的是**实施前**的样子（当时尚未改），
+> 保留它是为了说明「为什么要改」；当前状态以上方的实施状态列与 §9.4 为准。
+
+**实施前的代码现状（这是要被改掉的对象，不是授权范围）**：
 
 | 事实 | 证据 |
 |---|---|
@@ -54,9 +61,9 @@
 | **W3** | 新增鉴权 | `app/security.py` `Account`/`TokenStore` + `api.py` `auth` 中间件 | 身份模型见 §0.3，令牌卫生见 §0.4 | ✅ 已实施（scrypt + HMAC/令牌表） |
 | **W4** | 新增速率限制 | `app/security.py` `RateLimiter` | **必须处理 `X-Forwarded-For`**，否则反代后所有请求的源 IP 都变成代理 IP，限流形同虚设 | ✅ 已实施（fail-closed 采信） |
 
-**部署步骤见 `docs/public-deploy.md`。**
+**部署步骤见 `docs/public-deploy.md`；部署前要准备什么见 `docs/deploy-checklist.md`。**
 
-> ⚠️ **实施中发现的两个坑**（写在这里免得将来重犯）：
+> ⚠️ **实施中发现的三个坑**（写在这里免得将来重犯）：
 > 1. **uvicorn 默认 `proxy_headers=True`**，会拿 `X-Forwarded-For` 覆盖
 >    `request.client` —— 任何客户端加个这个头就能让限流按它声明的 IP 计数，
 >    **限流形同虚设**。已显式关掉（`api.py` 的 `make_uvicorn_config`），
@@ -64,6 +71,16 @@
 > 2. **健康检查必须豁免 Host 白名单**：反代的探针打过来时 Host 是**上游地址**
 >    （`127.0.0.1:8640`）而不是用户域名，按白名单拦会让公网部署的探针全 503，
 >    反代把服务踢下线。已豁免**且仅豁免** `/health/live` 与 `/health/ready`。
+> 3. **半开配置：白名单有域名但没鉴权**（2026-10-21 打包前自查发现，`f58bd37`）。
+>    `QBANK_ALLOWED_HOSTS=qbank.example.com` 但既不设 `QBANK_PUBLIC` 也不设
+>    `QBANK_PASSWORD_HASH` —— 绑着回环、**看起来**安全，可白名单里有外部域名
+>    就意味着存在一条能把外部请求带进来的路径（反代 / 端口转发 / 隧道）。
+>    本机直连会被 Host 白名单拦掉（403），owner 自测看到「打不开」会以为配置生效了；
+>    可反代把 `Host: qbank.example.com` 转发过来时请求全部放行 ——
+>    **任何人都能读走全部进度、备注、打卡记录**。
+>    现在的规则：**白名单里有非本机名 ⇒ 必须有鉴权**，否则拒绝启动
+>    （`security.Config.start_errors()`）。判据是「白名单里有没有非本机名」，
+>    不是「public 是不是 1」—— 能不能进来取决于白名单，不取决于开关。
 
 #### 公网模式下**继续保留**的部分
 
@@ -670,3 +687,51 @@ Python 解释器为仓库内 `.venv-build\Scripts\python.exe`（含 fastapi / uv
 > **跑测试时的环境坑**：本机若设了 `http_proxy` / `https_proxy`，子进程打向 `127.0.0.1`
 > 的请求会被代理拦成 502，症状伪装成「服务起不来」。`smoke_test.py` 的子进程测试
 > 已在 `spawn()` 里清掉这些变量；`curl` 打本地接口需手动加 `--noproxy '*'`。
+
+### 9.3 v3.0.0 发布基线（2026-10-21，`fb1acaa`）—— **当前以此为准**
+
+```
+$ .venv-build/Scripts/python.exe tools/smoke_test.py     → 109 通过 / 0 失败
+$ .venv-build/Scripts/python.exe tools/smoke_test.py --public → 118 通过 / 0 失败
+$ node tools/smoke_static.js                            → 通过 232 ｜ 失败 0
+$ .venv-build/Scripts/python.exe tools/smoke_api.py      → 通过 68 ｜ 失败 0
+$ .venv-build/Scripts/python.exe tools/smoke_parity.py   → 判分 65858 / 排期 2533 / 题型标签 2533，不一致均为 0
+$ .venv-build/Scripts/python.exe tools/audit_types.py    → exit 0
+$ .venv-build/Scripts/python.exe tests/test_security.py  → Ran 33 tests / OK
+$ node tests/verify_web.mjs                              → 通过 59 ｜ 失败 0
+$ .venv-build/Scripts/python.exe tests/test_frozen_dispatch.py → Ran 6 tests / OK
+```
+
+**为什么 9.2 的 55 要改成 68**：9.2 那时 `smoke_api.py` 还没覆盖统一错误格式、
+健康检查、PDF 文档端点与鉴权契约（`8c944c6` / `8ada58b` / `90c349e` 各加了用例）。
+以 9.3 为准。
+
+### 9.4 打包产物验收（2026-10-21，`fb1acaa` 后的 exe）
+
+`dist\mech-qbank.exe`（107,997,698 字节）逐条实测：
+
+| 项 | 实测 |
+|---|---|
+| 启动 | `/health/live` 200 `{"status":"ok"}`；`/health/ready` 200；组卷 `/api/v1/questions?limit=5` 200（5 题） |
+| 关机 | `POST /api/v1/system/shutdown` 200 `{"ok":true}`，进程 2.7s 内退出（码 0） |
+| `--pdf-worker` | 真 exe 走 client 的 frozen 分支 → `status=ok`、抽出字符 > 0（`tests/test_frozen_dispatch.py` 6/0） |
+| 前端 | 打 exe 起的服务 → 59/0（PDF 上传-轮询-摘录、窄屏、公网登录框全过） |
+| 本机模式 | 绑 `127.0.0.1`（非 0.0.0.0）；免鉴权 200；`/auth/status` → `auth_required:false` |
+| 公网模式 | 无令牌 401、错口令 401、正确口令 200+令牌、第 8 次错口令 429 |
+| 令牌卫生 | `dist\qbank.log` 里 `tok_` 0 处、明文口令 0 处、令牌 sha256 0 处 |
+| 冷启动 | Web **3.22s**（第二次 3.37s —— onefile 每次都要解包）；`--pdf-worker` 冷 5.95s / 热 6.05s |
+| file:// 离线 | 7/0（双击能开、非白屏、PDF 页提示「需要连接服务器」、控制台无 error） |
+
+> ⚠️ **测冷启动时必须杀整个进程树**（`taskkill /F /T`）。
+> PyInstaller onefile 的父进程被 kill 后子进程还活着并占着端口 ——
+> 下一次测量会连到**旧服务**上，报出 0.1s 这种假数字。
+
+> ⚠️ **`scrypt` 不在启动路径上**：公网模式冷启动 3.19s，与本机模式 3.22s 无差。
+> 口令哈希是**登录时懒验证**的，不在启动路径上 —— 不用担心 32 MB/次的 scrypt
+> 把启动拖慢。
+
+> **`.gitignore` 复核（2026-10-21）**：`web/dist/` 三个文件（`index.html` /
+> `qbank-data.js` / `assets/index-*.js`）都**被 git 跟踪**。
+> 本机 `core.autocrlf=true` 会把 LF 转成 CRLF（`index.html` 1199 → 1218 字节），
+> 但已用**真 clone + 逐字节比对 + file:// 实跑**验过：内容一致、CRLF 版
+> 5/0 全过（`document.write` 注入 `qbank-data.js` 那行不受影响）。

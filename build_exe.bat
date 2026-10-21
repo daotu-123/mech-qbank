@@ -48,6 +48,10 @@ echo Windowed build: double-click opens the browser, no console window.
 echo Quit via the page footer button; logs go to dist\qbank.log
 echo Put your own data\qbank.sqlite next to the exe to use the full library.
 echo PDF worker in this exe: "mech-qbank.exe --pdf-worker IN.pdf OUT.json"
-echo   (frozen cold start measured 2026-10-20: ~7.3s first run / ~6.0s warm,
+echo   (frozen cold start measured 2026-10-21: Web ~3.2s / worker ~6.0s,
 echo    vs ~2.9s non-frozen - the onefile bundle must be unpacked to a temp dir.)
+echo NOTE: security.py is bundled automatically (plain top-level import).
+echo   If PDF parsing times out in the exe, the usual cause is a missing
+echo   pymupdf in the bundle - the "pip install pymupdf" + "--collect-all
+echo   pymupdf" steps above are what prevent that.
 
