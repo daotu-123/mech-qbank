@@ -205,6 +205,23 @@ class Config:
         **fail-closed**：配置有问题就拒绝启动，而不是"降级着跑"。
         一个"公网模式但没配域名"的服务如果悄悄按本机模式跑，
         owner 会以为已经公网化了 —— 那比直接报错危险得多。
+
+        ## 半开配置也要拒绝（2026-10-21 打包前自查发现）
+        除了"公网模式配不全"，还有一种**更隐蔽**的半开状态：
+
+            QBANK_ALLOWED_HOSTS=qbank.example.com     # 白名单里有真实域名
+            # 但没设 QBANK_PUBLIC，也没设 QBANK_PASSWORD_HASH
+
+        它的表现是：绑 127.0.0.1（看起来很安全）、白名单里是公网域名、
+        **却完全没有鉴权**。本机直连会被 Host 白名单拦掉（403），
+        所以 owner 自测时看到的是"打不开"，会以为配置生效了；
+        但反代一旦把 `Host: qbank.example.com` 转发过来 —— 请求全部放行，
+        **任何人都能读走全部进度、备注、打卡记录**。
+
+        危险在于它"看起来"是安全的：绑定地址是回环、没开公网模式。
+        但 `QBANK_ALLOWED_HOSTS` 里有非本机名，就意味着**存在一条
+        能把外部请求带进来的路径**（反代 / 端口转发 / SSH 隧道）。
+        有外部入口就必须有鉴权 —— 这条不变量由下面的检查守住。
         """
         errs = []
         if self.public:
@@ -221,6 +238,20 @@ class Config:
         if self.bind == '0.0.0.0' and not self.public:
             errs.append('QBANK_BIND=0.0.0.0 需要同时设置 QBANK_PUBLIC=1'
                         '（默认只监听 127.0.0.1）')
+
+        # ---- 半开配置：白名单含非本机名，但没有鉴权 ----
+        # 判据是「白名单里有没有非本机名」，而不是「public 是不是 1」。
+        # 因为外部请求能不能进来，取决于白名单里有没有外部用的名字，
+        # 不取决于有没有开 public 开关。
+        local_names = {'127.0.0.1', 'localhost', '[::1]'}
+        external_hosts = sorted(self.allowed_hosts - local_names)
+        if external_hosts and not self.auth_enabled:
+            errs.append(
+                'QBANK_ALLOWED_HOSTS 里有非本机名（%s）但没有开启鉴权 —— '
+                '这等于「能进来的路开着、门却没锁」。'
+                '要么设 QBANK_PUBLIC=1（会强制要求 QBANK_PASSWORD_HASH），'
+                '要么把 QBANK_ALLOWED_HOSTS 改回只有本机名。'
+                % ', '.join(external_hosts))
         return errs
 
 

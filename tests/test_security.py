@@ -310,6 +310,51 @@ class W1BindAddressTest(unittest.TestCase):
         # 服务不该起来
         self.assertFalse(srv.wait_ready(timeout=3), '配置有问题时不该监听端口')
 
+    def test_external_host_without_auth_refuses_to_start(self):
+        """半开配置：白名单里有非本机名，但没鉴权 → 拒绝启动。
+
+        这是 2026-10-21 打包前自查抓到的漏洞。配置长这样：
+
+            QBANK_ALLOWED_HOSTS=qbank.example.com
+            # 没设 QBANK_PUBLIC，也没设 QBANK_PASSWORD_HASH
+
+        它看起来是安全的（绑 127.0.0.1），但白名单里放着外部域名，
+        说明**存在一条能把外部请求带进来的路径**（反代 / 端口转发）。
+        本机直连会被 Host 白名单拦掉（403），owner 自测时看到"打不开"
+        会以为配置生效了；可反代把 `Host: qbank.example.com` 转发过来
+        时请求全部放行 —— **任何人都能读走全部进度、备注、打卡**。
+
+        有外部入口就必须有鉴权。这条不变量由本测试守住。
+        """
+        cfg = security.Config({'QBANK_ALLOWED_HOSTS': 'qbank.example.com'})
+        errs = cfg.start_errors()
+        self.assertTrue(any('鉴权' in e for e in errs), errs)
+        # 顺带确认：这类配置下确实**没有**鉴权（否则这条检查是多余的）
+        self.assertFalse(cfg.auth_enabled)
+        # 绑的仍是回环 —— 说明危险不在绑定地址，而在「入口开着、门没锁」
+        self.assertEqual(cfg.bind, '127.0.0.1')
+
+    def test_external_host_with_password_hash_is_allowed(self):
+        """白名单含非本机名 + 有口令哈希 → 允许启动（不设 PUBLIC 也行）。
+
+        `auth_enabled` 的判据是「有口令哈希」或「开了公网模式」，
+        所以显式给哈希就已经有鉴权了，不必再开 PUBLIC。
+        """
+        cfg = security.Config({'QBANK_ALLOWED_HOSTS': 'qbank.example.com',
+                               'QBANK_PASSWORD_HASH': TEST_HASH})
+        self.assertTrue(cfg.auth_enabled)
+        self.assertEqual(cfg.start_errors(), [])
+
+    def test_local_only_hosts_without_auth_still_starts(self):
+        """白名单只有本机名 + 没鉴权 → 仍然允许启动。
+
+        这是**默认配置**（本机模式），必须不受上面那条新检查影响 ——
+        默认行为零变化是硬门。
+        """
+        cfg = security.Config({})
+        self.assertEqual(cfg.start_errors(), [])
+        self.assertEqual(set(cfg.allowed_hosts), {'127.0.0.1', 'localhost', '[::1]'})
+
 
 # ---------------------------------------------------------------- W2
 
