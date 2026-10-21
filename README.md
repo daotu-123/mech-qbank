@@ -117,7 +117,9 @@ mech-qbank/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
 │ ├ selfauthored/        原创自研题（手工维护的单一真相源，入库，公开版选择题来源）
 │ └ public/qbank.json    公开子集（示例数据，入库）
-├ docs/                   架构基线 / 公网部署指南 / PDF 方案 / 界面截图
+├ docs/                   架构基线 / 公网部署指南 / 部署清单 / PDF 方案 / 界面截图
+├ deploy/                 Linux 服务器部署工件（Caddyfile / systemd unit / 备份脚本 / 10 步指南）
+├ requirements-server.txt 服务器依赖（= requirements.txt + pymupdf，worker 需要）
 ├ build_exe.bat           PyInstaller 打包（api.py + web/dist，纯 ASCII）
 ├ start.bat               Windows 启动器（自动建 .venv-build，纯 ASCII）
 ├ CHANGELOG.md            版本变化记录
@@ -191,6 +193,29 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
 - **想暴露到公网**：默认配置**不要**直接暴露。设 `QBANK_PUBLIC=1` + 域名白名单 + 口令哈希后
   会切到「绑 `0.0.0.0` + 单账号鉴权 + 限流」，反代与 TLS 怎么配见
   **[`docs/public-deploy.md`](docs/public-deploy.md)**。缺域名或缺口令哈希 → **拒绝启动**（fail-closed）
+
+### 部署到 Linux 服务器
+
+> ⚠️ **`dist\mech-qbank.exe` 是 Windows 二进制，Linux 跑不了。**
+> VPS 上只能**源码运行**（`python app/api.py` + venv），
+> 且 PDF worker 走 `pdf_client` 的**非 frozen 分支**（`[python, app/pdf_worker.py, IN, OUT]`）。
+>
+> 服务器上需要额外装 `pymupdf`（worker 子进程要用，Web 进程不 import）：
+> ```bash
+> .venv/bin/pip install -r requirements-server.txt
+> ```
+
+**现成的部署工件**（照着填占位符即可）：
+
+| 文件 | 干什么 |
+|---|---|
+| [`deploy/README.md`](deploy/README.md) | **从零到可访问的 10 步**，每步带验证命令 + 「你要改哪几行」表 |
+| [`deploy/Caddyfile`](deploy/Caddyfile) | 反代 + 自动 TLS + 大文件放行 + XFF 传递 |
+| [`deploy/mech-qbank.service`](deploy/mech-qbank.service) | systemd unit（环境变量、重启策略、非 root、加固） |
+| [`deploy/backup.sh`](deploy/backup.sh) | 备份 / 恢复 / 校验（sqlite 热备份 + 恢复前校验） |
+
+- 部署前要准备什么（VPS / 域名 / TLS / 题库 / **数据备份**）→ [`docs/deploy-checklist.md`](docs/deploy-checklist.md)
+- 每个配置项的含义与全部环境变量 → [`docs/public-deploy.md`](docs/public-deploy.md)
 
 ## 已知边界
 

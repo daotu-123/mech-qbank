@@ -9,6 +9,18 @@
 > ⚠️ **本文里的每一样都不要跳过。** 跳错的代价不是"用不了"，
 > 而是**你的学习数据全泄露**或者**限流形同虚设**。
 
+> 📦 **部署工件已经写好了**（2026-10-21），不用从零写配置：
+>
+> | 文件 | 干什么 |
+> |---|---|
+> | [`deploy/README.md`](../deploy/README.md) | **从零到可访问的 10 步**，每步带验证命令 + 「你要改哪几行」表 |
+> | [`deploy/Caddyfile`](../deploy/Caddyfile) | 反代 + 自动 TLS + 大文件放行 + XFF 传递 |
+> | [`deploy/mech-qbank.service`](../deploy/mech-qbank.service) | systemd unit（环境变量、重启策略、非 root、加固） |
+> | [`deploy/backup.sh`](../deploy/backup.sh) | 备份 / 恢复 / 校验（已本地实跑验证） |
+> | `requirements-server.txt` | 服务器依赖（含 pymupdf，见 §1.2） |
+>
+> **本文是「要准备什么」，`deploy/README.md` 是「怎么做」。** 两份配合看。
+
 ---
 
 ## 0. 一句话总览
@@ -58,6 +70,79 @@
   现在这种配置会**直接拒绝启动**并打印原因。正确写法见 §8。
 
 - **别装宝塔面板之类的可视化面板**：多一层攻击面，且容易把防火墙规则改乱。
+
+### ⚠️ 1.1 部署形态是**源码运行**，不是跑那个 exe
+
+**`dist\mech-qbank.exe` 在 Linux 上跑不了。** 它是 PyInstaller 在 **Windows** 上打的
+（Windows PE 二进制），Linux 内核执行会报 `cannot execute binary file: Exec format error`。
+
+所以 VPS 上是**源码运行**：
+
+```bash
+cd /opt/mech-qbank
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-server.txt
+.venv/bin/python app/api.py          # ← 这才是服务器上的启动方式
+```
+
+**这不只是"换个启动方式"，PDF worker 的 spawn 形态也不同**：
+
+| | frozen（Windows exe，双击） | 非 frozen（Linux 源码） |
+|---|---|---|
+| worker 命令 | `[exe, '--pdf-worker', IN, OUT]` | `[python, app/pdf_worker.py, IN, OUT]` |
+| argv 分发在 | `app/api.py` 顶部（`import core` 之前） | `app/pdf_worker.py` 自己解析 |
+| 验证覆盖 | `tests/test_frozen_dispatch.py`（含真 exe） | `tests/test_source_deploy.py`（2026-10-21 新增） |
+
+`tests/test_source_deploy.py` 就是为这条路径补的：**真起子进程、真解析真 PDF**，
+验 worker 能跑、结果正确、不开端口、MuPDF 只在 worker 侧、缺 pymupdf 时能诊断。
+
+> ⚠️ 桌面 exe 用户**不需要** `requirements-server.txt` ——
+> 打包脚本自己会装 pymupdf（`build_exe.bat` 里的 `pip install pymupdf==2.0`
+> + `--collect-all pymupdf`）。
+
+### ⚠️ 1.2 服务器上必须装 pymupdf（但 Web 进程不 import 它）
+
+`requirements.txt` 刻意**不含** pymupdf —— 因为 **Web 进程（`app/api.py`）不 import 它**，
+保持零重依赖（`app/server.py` 是零第三方依赖的回退服务端，新层 import 第三方包会让那条路径失效）。
+
+但 **PDF worker 子进程必须有它**：`app/pdf_extract.py:78` 是全项目唯一
+`import pymupdf` 的地方，而它只在 worker 子进程里被加载。worker 与 Web 进程
+**用同一个解释器**（`sys.executable`），所以要装进**同一个 venv**。
+
+```bash
+# 做法（推荐）：用专门的服务器依赖文件
+.venv/bin/pip install -r requirements-server.txt
+# 里面是 requirements.txt 的内容 + pymupdf==2.0
+
+# 或等价的一行：
+.venv/bin/pip install "pymupdf==2.0"
+```
+
+**这不会让 Web 进程背上 MuPDF 的内存**：装在环境里 ≠ 被 import。
+实测（`tests/test_source_deploy.py` 的 d，用**干净子进程**验）：
+`import pdf_client` 之后 `sys.modules` 里**没有** pymupdf，只有 worker 子进程里才有
+（约 117 MB 的 MuPDF 运行时）。
+
+⚠️ **忘了装的症状**：Web 一切正常，但**上传 PDF 永远失败**。
+客户端报 `worker_crashed`，日志里有 `import_error`（**不是超时**）——
+所以能自检出来，不用干等 60 秒。
+
+```bash
+# 部署后立刻自检：
+.venv/bin/python -c "import pymupdf; print('pymupdf ok')"
+```
+
+### ⚠️ 1.3 服务器上没有桌面，`webbrowser` 必须关掉
+
+`app/api.py` 顶层 `import webbrowser`（标准库，Linux 上 import 没问题），
+但**只有** `QBANK_NO_BROWSER != '1'` 时才会调 `webbrowser.open()`。
+
+- systemd unit 里已设 `QBANK_NO_BROWSER=1` → **完全不走那条路**。
+- 万一忘了设：Linux 上 `webbrowser.open()` 在没有 DISPLAY 时通常**返回 False 而不抛异常**
+  （它会试 `xdg-open` / `www-browser` 等，找不到就放弃），但会在 journal 里留噪音。
+  极端情况（环境变量 `BROWSER` 指向坏命令）会在那个 Timer 线程里抛 →
+  **只打一条 traceback，不影响服务**（它在 `threading.Timer(0.8, ...)` 里，不在启动路径上）。
+- **结论**：设 `QBANK_NO_BROWSER=1` 就够了，**不需要额外处理 DISPLAY**。
 
 ---
 
@@ -125,18 +210,42 @@ scp data/qbank.sqlite user@vps:/srv/mech-qbank/data/qbank.sqlite
 
 | 文件 | 内容 | 丢了会怎样 |
 |---|---|---|
-| `qbank.sqlite` | 题库 | 可从本机重新传，但费事 |
-| `progress.json` | 答题进度 / 掌握度 / 错题 | **全部学习记录归零** |
-| `notes.json` | 每道题的备注 | 全部笔记丢失（这往往是手写的心血） |
+| `qbank.sqlite` | 题库 **+ 全量模式下的全部进度** | 可从本机重新传，但进度归零 |
+| `progress.json` | **公开模式**下的答题进度 / 掌握度 / 错题 | 全部学习记录归零 |
+| `notes.json` | 题目备注 | 全部笔记丢失（这往往是手写的心血） |
 | `checkin.json` | 打卡记录 | 连续天数断裂 |
 | `private/documents/` | 上传的 PDF 原文件 | 摘录素材丢失 |
 
-**建议方案**：
+> ⚠️ **进度存在哪 depends on 模式**（`core.py:11-19`）：
+> - **全量模式**（`data/qbank.sqlite` 存在）→ 进度写进 sqlite 的 **progress 表**，
+>   FSRS 状态写进 **fsrs_state 表**。此时 `progress.json` **根本不存在**。
+> - **公开模式**（只有 `data/public/qbank.json`）→ 进度写进 `progress.json`。
+>
+> 所以 **两个都要备份** —— 只备 sqlite 会丢备注和打卡，只备 JSON 会丢全量模式的进度。
+
+**用现成的脚本**（`deploy/backup.sh`，已本地实跑验证过备份+恢复+校验）：
+
+```bash
+# 备份（会立刻自校验：sha256 + tar 完整性 + JSON 合法 + sqlite integrity_check）
+sudo -u mechqbank /opt/mech-qbank/deploy/backup.sh backup
+
+# 加到 root 的 crontab（crontab -e）—— 每天 03:17，避开整点错开其它机器
+17 3 * * * APP_DIR=/opt/mech-qbank BACKUP_DIR=/var/backups/mech-qbank /opt/mech-qbank/deploy/backup.sh backup >> /var/log/mech-qbank/backup.log 2>&1
+```
+
+脚本自带这些保护：
+- **sqlite 用 `sqlite3 .backup` 做在线热备份**（WAL 模式安全，不用停服务）；
+  没装 `sqlite3` 时退回到「停服务 + cp」。
+- **备份完立刻校验**，校验不过直接报错（不产出"看起来能用"的备份）。
+- **恢复前先校验**，校验不过**拒绝恢复**（不拿未经验证的数据覆盖现网）。
+- 恢复时把现网数据**先挪到临时目录**（不删），出问题还能找回。
+- 自动清理超过 14 天的旧备份。
+
+**手动方案**（如果不想用脚本）：
 
 ```bash
 # 1) 每日凌晨 3:17 备份（避开整点，错开其它机器）
 17 3 * * * cd /srv/mech-qbank && tar czf backup-$(date +\%F).tar.gz data/
-
 # 2) 保留 14 天
 0 4 * * * find /srv/mech-qbank -name 'backup-*.tar.gz' -mtime +14 -delete
 ```
@@ -146,6 +255,8 @@ scp data/qbank.sqlite user@vps:/srv/mech-qbank/data/qbank.sqlite
 - **恢复要演练一次**：真出事时才发现备份脚本没跑，是最糟的结局。
   恢复步骤：停服务 → 解压覆盖 `data/` → 起服务。
 - ⚠️ `progress.json` 等是**文件 I/O**（不是 sqlite），备份时别漏。
+- ⚠️ **正在写的时候直接 tar sqlite 会拿到撕裂的快照** —— 脚本用
+  `sqlite3 .backup` 避开这个坑；手动方案要先停服务。
 
 ---
 
@@ -170,17 +281,22 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 ## 8. 环境变量清单（部署时的实际配置）
 
+> 📌 **这些值已经写进 [`deploy/mech-qbank.service`](../deploy/mech-qbank.service) 了。**
+> 部署时只需要把里面的 `${...}` 占位符替换掉，不用在这里再抄一遍。
+
 ```bash
 # ✅ 推荐配置：应用层有鉴权 + 网络层只听回环 + 反代在前面挡
 QBANK_PUBLIC=1                  # 强制开启鉴权（并强制要求下面的哈希与域名）
 QBANK_PASSWORD_HASH='scrypt$32768$8$1$...'   # tools/hash_password.py 生成
 QBANK_ALLOWED_HOSTS=qbank.example.com
-QBANK_TRUSTED_PROXIES=127.0.0.1
+QBANK_BIND=127.0.0.1            # 只听回环，由反代挡在前面
+QBANK_TRUSTED_PROXIES=127.0.0.1 # 本机的 Caddy
 QBANK_PORT=8640
+QBANK_TOKEN_SECRET='<64 位 hex>' # 会话密钥
+QBANK_NO_BROWSER=1              # 服务器没有桌面（见 §1.3）
 ```
 
-- `QBANK_PUBLIC=1` 默认让应用绑 `0.0.0.0`。若想让反代走回环，
-  追加 `QBANK_BIND=127.0.0.1`（公网模式下允许显式指定绑定地址）。
+- `QBANK_PUBLIC=1` 默认让应用绑 `0.0.0.0`。**显式设 `QBANK_BIND=127.0.0.1`** 让它只听回环。
   此时**端口绝不能**在安全组里对公网开放 —— 只留 `22/80/443`。
 - **不要**配「白名单有域名但没哈希」这种半开组合：现在会**拒绝启动**并说明原因
   （见 §1 的说明）。
@@ -190,31 +306,36 @@ QBANK_PORT=8640
 
 ## 9. 部署后自检（照着做，10 分钟）
 
+> 完整版在 [`deploy/README.md` 第 10 步](../deploy/README.md)。这里是速查版。
+
 ```bash
 # 1) 健康检查（反代探针打的就是这个，必须 200）
 curl -i http://127.0.0.1:8640/health/live
 
-# 2) 走域名 + TLS（如果开了公网模式，这里必须是 401）
+# 2) 走域名 + TLS（公网模式下必须是 401）
 curl -i https://qbank.example.com/api/v1/stats
 
 # 3) 陌生 Host 必须被拒（403）—— 这条要过，说明白名单真的在生效
 curl -i -H 'Host: evil.example.com' https://qbank.example.com/api/v1/stats
 
 # 4) 上传一个真 PDF，走通上传→解析→取结果
+#    ⚠️ 这一条同时验了「服务器上装了 pymupdf」（见 §1.2）
 curl -i -X POST https://qbank.example.com/api/v1/documents \
      -H "Authorization: Bearer $TOKEN" \
      -F 'file=@你的.pdf'
 
 # 5) 备份任务真的在跑
-systemctl list-timers | grep mech   # 或 crontab -l
+crontab -l | grep backup.sh
 ```
 
 另外手测一遍：
 
-- [ ] 手机浏览器打开域名，能看到登录框（如果开了公网模式）并能登录
+- [ ] 手机浏览器打开域名，能看到登录框并能登录
 - [ ] 答一题、刷新页面，进度还在（说明真的落盘了，不是只在内存）
 - [ ] 故意输错口令连打 6 次，第 6 次开始应该被限流
+- [ ] 上传一个 PDF 能解析（验 §1.2 的 pymupdf 装对了）
 - [ ] 断网重连后仍能访问（TLS 证书没问题）
+- [ ] **跑一次备份 + 恢复演练**（`deploy/backup.sh backup` 然后 `restore`）
 
 ---
 
@@ -235,4 +356,5 @@ systemctl list-timers | grep mech   # 或 crontab -l
 2. **数据备份存哪？** 只在 VPS 本机，还是再同步一份到别处？
    （我的建议：必须有一份在本机之外。）
 
-这两件定了之后，我可以把具体的 systemd unit + Caddyfile + 备份脚本写出来。
+这两件定了之后，部署工件（systemd unit / Caddyfile / 备份脚本）已经写好了，
+照着 [`deploy/README.md`](../deploy/README.md) 的 10 步走就行。

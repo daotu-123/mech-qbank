@@ -735,3 +735,72 @@ $ .venv-build/Scripts/python.exe tests/test_frozen_dispatch.py → Ran 6 tests /
 > 本机 `core.autocrlf=true` 会把 LF 转成 CRLF（`index.html` 1199 → 1218 字节），
 > 但已用**真 clone + 逐字节比对 + file:// 实跑**验过：内容一致、CRLF 版
 > 5/0 全过（`document.write` 注入 `qbank-data.js` 那行不受影响）。
+
+### 9.5 Linux 部署工件（2026-10-21，`a31e1e3` / `ec3ece9`）
+
+**部署形态 = 源码运行，不是跑 exe。**
+`dist\mech-qbank.exe` 是 PyInstaller 在 **Windows** 上打的（PE 格式），
+Linux 内核执行会报 `cannot execute binary file`。
+所以 VPS 上是 `python app/api.py` + venv，且 PDF worker 走
+`pdf_client.worker_command()` 的**非 frozen 分支**
+（`[python, app/pdf_worker.py, IN, OUT]`）。
+
+| 分支 | worker 命令 | 验证 |
+|---|---|---|
+| frozen（Windows exe） | `[exe, '--pdf-worker', IN, OUT]` | `tests/test_frozen_dispatch.py`（含真 exe） |
+| 非 frozen（Linux 源码） | `[python, app/pdf_worker.py, IN, OUT]` | `tests/test_source_deploy.py`（2026-10-21 新增，5 项） |
+
+> ⚠️ 补这条之前，**非 frozen 分支只测过命令形状**（`tests/test_pdf_client.py`
+> 的 d，打桩验证 `[PY, WORKER_SCRIPT, IN, OUT]`），**从没端到端真跑过 worker**。
+> 注入验证：把非 frozen 分支改成 frozen 形态 → 2 项红。
+
+**pymupdf 的装法**：`requirements.txt` 刻意不含（Web 进程不 import 它），
+但 worker 子进程必须有 → 新增 `requirements-server.txt`（= requirements.txt +
+`pymupdf==2.0`，版本与 `build_exe.bat` 一致）。
+
+> **装在环境里 ≠ 被 import**：实测（干净子进程验）`import pdf_client` 之后
+> `sys.modules` 里**没有** pymupdf，只有 worker 子进程里才有（约 117 MB MuPDF）。
+> 忘了装的症状：Web 正常但**上传 PDF 全失败**，日志里有 `import_error`
+> （**不是超时**）—— 所以能自检出来。
+
+**部署工件**（`deploy/`）：`Caddyfile` / `mech-qbank.service` / `backup.sh` /
+`README.md`（10 步从零到可访问 + 占位符表）。所有需 owner 填的用
+`${DOMAIN}` / `${APP_PORT}` / `${PASSWORD_HASH}` 等占位符标出。
+
+**`tests/check_deploy_files.py`（19 项）**：systemd unit 与 Caddyfile 是**配置**，
+不随代码改动被测试覆盖 → 手误要到真部署那一刻才炸。本文件把已知陷阱变成
+可复跑断言：段归属（`StartLimit*` 必须在 `[Unit]`）、必需项齐全、非 root、
+`ReadWritePaths` 的 `-` 前缀、Caddyfile 重复指令、占位符两边一致、
+`backup.sh` 语法与数据覆盖。注入验证：注入 5 个错误 → 5 项红。
+
+> ⚠️ **`backup.sh` 本地实跑抓到 3 个真 bug**（不实跑就发现不了）：
+> 1. **`cp -r src dst` 在 dst 已存在时变成 `dst/src`** → 恢复出
+>    `documents/documents/` 双层（且**每恢复一次多一层**）。改用 `src/.` 形式
+>    + 加保险检查（恢复后显式查双层，查到就中止）。
+> 2. **EXIT trap 的 `rm` 失败会改变脚本退出码** → 成功操作被报成失败。
+>    改成 trap 里先存 `$?`、清完再 `exit "${rc}"`。
+> 3. **`set -e` 下命令替换里的失败会中断脚本**（`stat` 的 GNU/BSD 参数不同）。
+>    加固 6 处。
+>
+> 实跑验证：backup → 破坏数据 → restore → 逐项核对 **6/6**
+> （备注/打卡/进度/上传的 PDF/题库 sqlite/无双层），
+> 四个子命令退出码语义全对（成功 0、失败 1）。
+
+> ⚠️⚠️ **`autocrlf=true` 会毁掉部署工件 —— 与 PDF 样本同一类问题**
+> （2026-10-21 真 clone 时发现，`ec3ece9`）。
+> clone 出来的 `deploy/backup.sh` 有 **350 个 CR 字节**，shebang 变成
+> `#!/usr/bin/env bash\r` → Linux 上直接执行报 `bad interpreter`。
+> （`bash script` 能跑是因为**绕过了 shebang** → 本机自测发现不了，
+> 只有**真 clone + 真 Linux** 才暴露。）
+> 修法：`.gitattributes` 加 `eol=lf` 规则（`deploy/*.sh`、`deploy/*.service`、
+> `deploy/Caddyfile`、`*.sh`、`*.service`；`*.bat` 相反用 `eol=crlf`）。
+> 已用**真 clone** 验：CR 字节数全为 0，shebang 干净，
+> 且在 clone 副本上跑通 backup → 破坏 → restore → 核对。
+> 守这条的断言在 `tests/check_deploy_files.py`（19 项里占 3 条）。
+
+> **headless 的 `webbrowser`**：`app/api.py` 顶层 `import webbrowser`
+> （标准库，Linux 上 import 没问题），但**只有** `QBANK_NO_BROWSER != '1'`
+> 才调 `webbrowser.open()`。systemd unit 里设 `QBANK_NO_BROWSER=1` →
+> 完全不走那条路，**不需处理 DISPLAY**。即使忘了设：无 DISPLAY 时
+> `open()` 通常返回 False 而不抛异常，且它在 `threading.Timer` 线程里
+> → **不影响服务启动**。

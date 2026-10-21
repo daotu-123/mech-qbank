@@ -129,6 +129,17 @@ ls app/api.py app/security.py web/dist/index.html
 # 应能看到 api.py、security.py 与 web/dist/index.html
 ```
 
+> ⚠️ **换行符必须是 LF**。本仓库的 `.gitattributes` 已经用 `eol=lf` 钉死了
+> 部署工件（`deploy/backup.sh`、`deploy/*.service`、`deploy/Caddyfile`），
+> 所以 `git clone` 出来的就是 LF。
+> 2026-10-21 实测：没钉之前，`autocrlf=true` 的机器 clone 出来的
+> `backup.sh` 有 350 个 CR 字节，shebang 变成 `#!/usr/bin/env bash\r` →
+> Linux 上直接执行报 `bad interpreter`。
+> **验一下**（应该输出 0）：
+> ```bash
+> tr -cd '\r' < deploy/backup.sh | wc -c
+> ```
+
 ### 第 4 步：建 venv 并装依赖（含 pymupdf）
 
 ```bash
