@@ -4,6 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0%20%2B%20CC--BY--SA--4.0-green)](#数据来源与许可重要)
+[![Version](https://img.shields.io/badge/version-3.0.0-3776ab)](CHANGELOG.md)
 
 | 选择题：ABCD 按钮 | 判断题：✅❌ 按钮 | 学习打卡 | 题目备注 |
 |---|---|---|---|
@@ -54,6 +55,7 @@ cd web && npm install && npm run build && cd ..
 | 知识点 | 卡片式知识点（一卡 = 一个结论 + 关键数字/公式 + 关联题号），支持搜索 |
 | 进度 | 题库总量 / 已答 / 掌握 / 错题 / 待复习 / 今日已学 / 难度分布 / 题型分布；**学习打卡**（连续天数 + 月历，答题自动打卡、可手动补签）；**我的备注**（全量列表，每条标着题号 + 题干 + 题型，可跳回原题或删除）；进度导出导入（JSON）；**题库导入**（在线/离线都支持） |
 | PDF 摘录 | 从 PDF 复制文本粘贴（或拖入 .txt/.md）→ 按段落拆分 → **划词挖空**（选中词变成【1】【2】空位并自动记为答案）或**设为判断题**（对/错开关 + 题解）→ 实时预览 → 一键存入题库「PDF 自建」组，直接参与组卷与复习排期 |
+| PDF 文档 | **直接上传 .pdf 文件**（≤10 MB）→ 服务端后台解析出全文与页码锚点 → 左侧选页、右侧定位 → 选中段落送去「PDF 摘录」建题。上传立即返回、解析异步进行，页面轮询进度；解析在**独立子进程**里做，崩了不影响服务 |
 
 - 判分本地完成：选择/判断自动判（多选需全选对）；**挖空填空题按空逐一比对**（多空、全角半角/空白/句号自动归一，逐空标对错）；长答案问答自评；「答案待补」会明示
 - 作答按钮化：选择题为 ABCD 字母徽章按钮（提交后正确项恒标绿、选错标红）；无选项判断题为 ✅/❌ 两个大按钮，键盘 `1`/`T` = 对、`2`/`F` = 错；可判分填空题渲染「第 N 空」输入框（Tab 切换）
@@ -86,6 +88,16 @@ mech-qbank/
 ├ app/core.py             数据层（判分/排期/打卡/备注，server.py 与 api.py 共用）
 ├ app/api.py              服务端（FastAPI + uvicorn，RESTful /api/v1/*，主入口）
 ├ app/server.py           服务端（标准库 http.server，零依赖备选，老路由）
+├ app/storage.py          文件 I/O 的唯一出口（纯标准库）
+├ app/repository.py       SQL 的唯一出口（纯标准库）
+├ app/service.py          业务用例层（纯标准库，不做 HTTP 翻译）
+├ app/security.py         公网安全原语（纯标准库：scrypt 口令 / HMAC 令牌表 / 限流 / XFF 采信）
+├ app/errors.py           统一错误格式（纯标准库，唯一真源）
+├ app/multipart.py        multipart/form-data 解析（纯标准库，两端共用）
+├ app/docstore.py         PDF 文档域：落盘 + job 表 + 后台解析（纯标准库）
+├ app/pdf_client.py       PDF 解析的调用方（纯标准库，不 import pdf_extract）
+├ app/pdf_worker.py       PDF 解析的子进程入口（独立进程，崩了不影响 Web）
+├ app/pdf_extract.py      PDF 抽取器（唯一 import pymupdf 的地方）
 ├ web/                    前端工程（Vue 3 + Element Plus + Vite）
 │ ├ src/                  组件/视图/store/api/router
 │ ├ public/qbank-data.js  静态模式内置数据（tools/make_webdata.py 生成，勿手改）
@@ -99,14 +111,16 @@ mech-qbank/
 ├ tools/smoke_api.py      冒烟测试：FastAPI RESTful 契约（方法/状态码/白名单/shutdown）
 ├ tools/audit_types.py    题型审查：按结构证据核对每道题的题型是否自洽，输出问题清单
 ├ tools/audit_choice_answers.py  选择题答案体检：答案文本与选项文本比对，推不出的列人工清单
+├ tools/hash_password.py   交互式生成 scrypt 口令哈希（不回显、不留 shell 历史）
 ├ tools/answer_fix.tsv    人工核定过的答案覆盖表（题号+字母+依据），构建时重放，重建不丢
 ├ data/
 │ ├ qbank.sqlite         全量库（本地生成，不入库）
 │ ├ selfauthored/        原创自研题（手工维护的单一真相源，入库，公开版选择题来源）
 │ └ public/qbank.json    公开子集（示例数据，入库）
-├ docs/                   界面截图（README 展示用）
+├ docs/                   架构基线 / 公网部署指南 / PDF 方案 / 界面截图
 ├ build_exe.bat           PyInstaller 打包（api.py + web/dist，纯 ASCII）
 ├ start.bat               Windows 启动器（自动建 .venv-build，纯 ASCII）
+├ CHANGELOG.md            版本变化记录
 └ BUILD_REPORT.md         构建报告（本地生成，不入库）
 ```
 
@@ -163,14 +177,20 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
   --exclude-module tkinter app/api.py
 ```
 
-产物 `dist\mech-qbank.exe`（约 18 MB，实测）：
+产物 `dist\mech-qbank.exe`（约 **108 MB**，实测 —— 含 PyMuPDF 及其约 105 MB 二进制资源；不含 PDF 功能时约 18 MB）：
 
 - **双击即用**：自带公开题库（266 题 + 387 知识点卡，其中 190 道为可自动判分的原创选择题），自动开浏览器，进度写在 exe 同级的 `data\progress.json`
 - **无终端窗口**：`--windowed` 打包，双击后只有浏览器界面；日志写 exe 同级 `qbank.log`（启动信息、异常堆栈），排查问题先看它
 - **怎么退出**：点页面右下角「退出程序」按钮（调 `POST /api/v1/system/shutdown`，同样只放行本机 Host）；没有终端可按 Ctrl+C
 - **想用你自己的全量库**：把 `qbank.sqlite` 放进 exe 同级的 `data\` 目录即可，程序自动切换成全量模式（实测：2330 题）
+- **PDF 解析在 exe 里可用**：`build_exe.bat` 会 `pip install pymupdf==2.0` + `--collect-all pymupdf`
+  （普通 hidden-import 发现不了 PyMuPDF 的二进制资源，不加这两步则 exe 里 PDF 解析全部超时）
 - 端口默认 8640，可用环境变量 `QBANK_PORT` 改；`QBANK_NO_BROWSER=1` 可关掉自动开浏览器
-- 服务**只监听 127.0.0.1**，且校验请求的 `Host`/`Origin` 必须在 `127.0.0.1` / `localhost` 白名单内 —— 用于防御 DNS rebinding 攻击（恶意网页把域名重绑到本机回环后即可同源读取学习数据）；因此**不要**把它暴露到局域网或公网
+- **默认**只监听 `127.0.0.1`，且校验请求的 `Host`/`Origin` 必须在 `127.0.0.1` / `localhost` 白名单内 ——
+  用于防御 DNS rebinding 攻击（恶意网页把域名重绑到本机回环后即可同源读取学习数据）
+- **想暴露到公网**：默认配置**不要**直接暴露。设 `QBANK_PUBLIC=1` + 域名白名单 + 口令哈希后
+  会切到「绑 `0.0.0.0` + 单账号鉴权 + 限流」，反代与 TLS 怎么配见
+  **[`docs/public-deploy.md`](docs/public-deploy.md)**。缺域名或缺口令哈希 → **拒绝启动**（fail-closed）
 
 ## 已知边界
 
@@ -179,6 +199,14 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
 - 多选题需**全选对**才计正确（漏选/多选均计错，进错题本）
 - 部分题目标注「答案待补」，界面会明示；此类题无法自动判分
 - 知识点卡片由题目归纳而来，数值以图纸/标准/厂商样本为准
+- **PDF 表格不做结构化**：PyMuPDF 的 `find_tables()` 在 500 页样本上多耗 100.48 s、多占 368 MB，
+  首版只抽文本与页码锚点（表格里的文字能读到，但格子结构丢失）
+- **PDF 解析的硬内存上限未实现**：没有 Job Objects 限制子进程内存，
+  兜底是超时（60 s）+ 串行 + 进程隔离
+- **批量上传、多账号不做**：一次一个 PDF；身份模型就是单账号
+- **令牌不持久化到 localStorage**：access token 只放内存，refresh 放 sessionStorage
+  （理由见 `docs/architecture-baseline.md` §0.4）
+- **PDF 文档的 job 状态不跨重启**：进程重启后遗留的 `running`/`queued` 会被标为 `interrupted`
 
 ## 路线图
 
@@ -192,3 +220,7 @@ pyinstaller --noconfirm --onefile --windowed --name mech-qbank ^
 - [x] 学习打卡：答题自动打卡 + 手动补签 + 连续天数 + 月历记录（静态模式存 localStorage，在线模式存 `data/checkin.json`）
 - [x] 架构迁移：前端 Vue 3 + Element Plus（Vite，`web/`），后端 FastAPI RESTful（`app/api.py`），数据层抽成 `app/core.py` 两端共用；file:// 双模式保留（IIFE 单包 + 入口标签改写），判分/排期由 `smoke_parity.py` 差分守护
 - [x] PDF 摘录编辑器：粘贴 PDF 文本 → 划词挖空 / 设为判断题 → 一键入库（`PDF 自建` 组）；填空按空逐一自动判分（多空 `|` 分隔，全角/空白/句号归一），自定义题在线存 sqlite（`source_class=自定义`，重建题库自动迁移保留）、离线存 localStorage
+- [x] **后端分层**：`storage → repository → service → core → router`，新增三层只允许标准库（保住零依赖回退路径）
+- [x] **统一错误格式 + 健康检查**：`{"error":{code,message,request_id}}`，`/health/live` 与 `/health/ready`
+- [x] **PDF 文档域**：直接上传 .pdf → 后台解析（独立子进程）→ 页码锚点 → 送去摘录建题
+- [x] **公网暴露安全 W1–W4**：绑定地址 / Host 白名单配置化、单账号鉴权（scrypt + 可撤销令牌表）、限流（退避 + 上传窗口）；默认行为零变化

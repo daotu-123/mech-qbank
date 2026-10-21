@@ -110,7 +110,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
 
-app = FastAPI(title='mech-qbank', version='2.0', docs_url=None, redoc_url=None,
+app = FastAPI(title='mech-qbank', version='3.0', docs_url=None, redoc_url=None,
               openapi_url=None)          # 本机自用工具，不开 Swagger 减少攻击面
 # 请求体上限 10 MB：与 server.py 的 clamp_int(..., 0, 10*1024*1024) 同口径。
 # 公网化后反代也应有同等限制，这一层是应用侧的兜底。

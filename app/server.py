@@ -106,7 +106,7 @@ def _n_arg(q: dict, default: int = 10) -> int:
 
 # ---------------------------------------------------------------- HTTP
 class H(BaseHTTPRequestHandler):
-    server_version = 'mech-qbank/1.0'
+    server_version = 'mech-qbank/3.0'
     protocol_version = 'HTTP/1.1'   # keep-alive：前端一连多个 API 调用少握手
     timeout = 60                    # 空闲连接 60s 自动收，避免线程堆积
 
