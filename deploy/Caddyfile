@@ -1,0 +1,57 @@
+# mech-qbank · 反向代理配置（Caddy）
+#
+# 用法：
+#   1. 把本文件复制到 /etc/caddy/Caddyfile
+#   2. 把 ${...} 占位符换成你的真实值（Caddyfile **不支持** shell 变量展开，
+#      必须手工替换）
+#   3. caddy validate --config /etc/caddy/Caddyfile
+#   4. systemctl reload caddy
+#
+# 详见 deploy/README.md 的「你需要改哪几行」表。
+
+{
+	# 管理后台只监听本机。公网不需要它。
+	admin 127.0.0.1:2019
+
+	# 自动申请 + 自动续期 Let's Encrypt 证书。
+	# email 用来接收证书到期/续期通知，换成你自己的。
+	email ${ACME_EMAIL}
+}
+
+# ---------------------------------------------------------------- 主站
+${DOMAIN} {
+	# Caddy 默认会：自动 HTTPS、自动带 X-Forwarded-For、保留原始 Host 头。
+	# 这三件事正是我们要的（详见 docs/public-deploy.md §3.1）。
+	#
+	# ⚠️ 不要改成其它地址 —— 应用自己只监听 127.0.0.1
+	#    （见 deploy/mech-qbank.service 的 QBANK_BIND）。
+	reverse_proxy 127.0.0.1:${APP_PORT}
+
+	# --- 放行大文件上传 ---
+	# 应用侧上限是 10 MB（MAX_BODY_BYTES），留一点余量给 multipart 开销。
+	# 不配的话 Caddy 也没有默认上限（不像 nginx 有 1M），但显式写出来更清楚。
+	request_body {
+		max_size 12MB
+	}
+
+	# --- 访问日志 ---
+	# ⚠️ 这里**故意不记 Authorization 头**。Caddy 默认只记请求行/状态/耗时，
+	#    不记请求头，所以令牌不会进日志。
+	#    但如果以后加了 `log { header Authorization ... }` 就会泄漏 —— 别加。
+	log {
+		output file /var/log/caddy/mech-qbank.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format json
+	}
+
+	# --- 响应头 ---
+	header {
+		# 去掉 Caddy 默认加的 Server 头（少露一点指纹）。
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options SAMEORIGIN
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

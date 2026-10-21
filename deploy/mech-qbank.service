@@ -1,0 +1,148 @@
+# mech-qbank · systemd 服务单元
+#
+# 用法：
+#   1. 把本文件复制到 /etc/systemd/system/mech-qbank.service
+#   2. 替换所有 ${...} 占位符（**必须手工替换**，systemd 不做变量展开）
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now mech-qbank
+#   5. sudo systemctl status mech-qbank
+#
+# 详见 deploy/README.md 的「你需要改哪几行」表。
+#
+# ⚠️ **不要用 root 跑。** 见文件末尾的「为什么不用 root」。
+
+[Unit]
+Description=mech-qbank 机械题库（FastAPI）
+Documentation=https://github.com/daotu-123/mech-qbank
+After=network-online.target
+Wants=network-online.target
+
+# ⚠️ StartLimitIntervalSec / StartLimitBurst **必须写在 [Unit] 段**。
+#    写在 [Service] 段会被 systemd 当成未知键名而**忽略**（只报一条 warning），
+#    结果是「配置错误导致秒退」时会陷入无限重启。
+#    语义：300 秒内最多启动 5 次，超过就放弃（不再重试），避免刷屏。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------- 运行身份
+# ⚠️ **不要用 root。** 详见文件末尾说明。
+#    这个用户只需要：读代码目录 + 写 ${DATA_DIR}。
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+
+# ---------------------------------------------------------------- 路径
+WorkingDirectory=${APP_DIR}
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/app/api.py
+
+# ---------------------------------------------------------------- 环境变量
+# ⚠️ 这些是**部署到 VPS 必须设的**。少设任何一条，要么起不来（fail-closed），
+#    要么裸奔（无鉴权）。逐条解释见 docs/public-deploy.md §2。
+Environment="QBANK_PUBLIC=1"
+Environment="QBANK_ALLOWED_HOSTS=${DOMAIN}"
+Environment="QBANK_PASSWORD_HASH=${PASSWORD_HASH}"
+Environment="QBANK_TOKEN_SECRET=${TOKEN_SECRET}"
+Environment="QBANK_TOKEN_TTL=43200"
+
+# 应用只监听回环，由 Caddy 反代进来。
+# ⚠️ 设 0.0.0.0 会让应用直接暴露在公网（绕过反代的 TLS 与限流配置）。
+Environment="QBANK_BIND=127.0.0.1"
+Environment="QBANK_PORT=${APP_PORT}"
+
+# 受信反代 = 本机的 Caddy。Caddy 带的 X-Forwarded-For 只在这个前提下才采信。
+# ⚠️ 漏了这条 → 服务端忽略 XFF，一律用真实对端地址 = 127.0.0.1
+#    → **所有请求的限流计数都算在反代头上**，一个人就能把全站打限流。
+Environment="QBANK_TRUSTED_PROXIES=127.0.0.1"
+
+# 服务器上没有桌面，**必须**关掉「自动开浏览器」。
+# api.py 顶层 import webbrowser，但只有 QBANK_NO_BROWSER != '1' 时才会调用
+# webbrowser.open() —— 设为 1 就完全不走那条路（详见 deploy/README.md §0）。
+Environment="QBANK_NO_BROWSER=1"
+
+# 让 Python 的输出不被缓冲（否则 journalctl 里看不到实时日志）。
+Environment="PYTHONUNBUFFERED=1"
+# UTF-8（中文题库/备注；不设的话 systemd 环境下可能乱码）。
+Environment="PYTHONIOENCODING=utf-8"
+
+# ---------------------------------------------------------------- 重启策略
+# always：进程挂了/被 OOM kill 了自动拉起。
+# 5s：避免「配置错误导致秒退」时疯狂重启刷屏。
+Restart=always
+RestartSec=5
+
+# ---------------------------------------------------------------- 资源限制
+# PDF 解析在**子进程**里做，内存峰值约 200 MB（500 页 PDF 实测）。
+# 这些限制比实际需求宽，给够余量。
+#
+# ⚠️ TasksMax 要给够：uvicorn 的 anyio 线程池默认 40 线程，
+#    加上 docstore 的后台解析线程 + worker 子进程，64 偏紧。给 256。
+MemoryMax=2G
+TasksMax=256
+
+# ---------------------------------------------------------------- 加固
+# systemd 自带的一批沙箱。缩小被攻破后的影响面。
+#
+# ⚠️ **如果服务起不来（且 journal 里没有明确的报错），
+#    先把下面「可能与本项目冲突」标记的三行注释掉再试。**
+#    它们在别的项目上好用，在这里不一定 —— 本项目是 Python + PyMuPDF，
+#    有些库会申请可执行内存或用非标准系统调用。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# ↓↓↓ 可能与本项目冲突（Python 扩展有时需要可执行内存）↓↓↓
+# MemoryDenyWriteExecute=yes
+# ↓↓↓ 可能与本项目冲突（@system-service 过滤掉了少数系统调用）↓↓↓
+# SystemCallFilter=@system-service
+# SystemCallArchitectures=native
+
+# ⚠️ ProtectSystem=strict 会把**整个文件系统**挂成只读 ——
+#    所以必须显式把数据目录列为可写，否则服务写不了进度文件。
+#
+# ⚠️⚠️ **路径必须带 `-` 前缀**：
+#    systemd 的 ReadWritePaths 若指向**不存在**的路径（没有 `-` 前缀时），
+#    单元会**直接启动失败**（报 "Failed to set up mount namespacing"）。
+#    带 `-` 表示「不存在就忽略」。
+#    带上前缀后，即使目录不存在也不影响启动 ——
+#    app/core.py 在 import 时会自己建 DATA 目录（DATA.mkdir(parents=True, exist_ok=True)）。
+#
+# ⚠️ 但 data/ 目录**必须**在服务用户有写权限的路径下（/opt/mech-qbank/data）。
+#    若 ${APP_DIR} 在 /home/ 下，ProtectHome=yes 会挡住它 → 换成 /opt 或 /srv。
+ReadWritePaths=-${DATA_DIR}
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mech-qbank
+
+[Install]
+WantedBy=multi-user.target
+
+# ================================================================
+# 为什么不用 root
+# ================================================================
+# 1. **服务会被打**。公网服务迟早有人尝试漏洞利用。
+#    root 跑的话，一个 RCE 就等于整机沦陷；
+#    专用用户跑，攻击者只能碰到 ${DATA_DIR} 里那几个文件。
+# 2. **最小权限**。这个服务只需要：读代码 + 写 data/。
+#    写 /etc、/usr、/root 都不需要。
+# 3. **systemd 自带的加固在 root 下大部分失效**
+#    （ProtectSystem=strict 对 root 依然有效，但 NoNewPrivileges 等
+#    在 root 下意义打折）。
+# 4. **审计**。journal 里记的是 ${SERVICE_USER} 做的操作，出事能追。
+#
+# 建用户（部署时执行一次）：
+#   sudo useradd --system --home ${APP_DIR} --shell /usr/sbin/nologin ${SERVICE_USER}
+#   sudo mkdir -p ${APP_DIR}/data
+#   sudo chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${APP_DIR} ${DATA_DIR}
+#
+# ⚠️ **不要用 root 跑，也不要用能 sudo 的账号跑。**

@@ -1,0 +1,38 @@
+# 服务器端依赖（VPS / Linux 源码部署用）
+#
+# ⚠️ **为什么要有这个文件**
+#   requirements.txt 刻意**不含** pymupdf —— 因为 Web 进程（app/api.py）
+#   **不 import 它**，保持零重依赖（server.py 是零第三方依赖的回退服务端，
+#   新层 import 第三方包会让那条路径失效）。
+#
+#   但 **PDF worker 子进程必须有 pymupdf**：
+#     app/pdf_extract.py:78 是全项目唯一 `import pymupdf` 的地方，
+#     而它只在 worker 子进程里被加载。
+#
+#   worker 与 Web 进程**用同一个解释器**（`sys.executable`），
+#   所以服务器上必须把 pymupdf 装进**同一个 venv**。
+#
+#   ⚠️ 这**不会**让 Web 进程背上 MuPDF 的内存：
+#     装在环境里 ≠ 被 import。实测（tests/test_source_deploy.py 的 d）：
+#     `import pdf_client` 之后 `sys.modules` 里**没有** pymupdf，
+#     只有 worker 子进程里才有（约 117 MB 的 MuPDF 运行时）。
+#
+# 用法（在服务器上）：
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-server.txt
+#
+# ⚠️ 桌面 exe 用户**不需要**这个文件 —— 打包脚本自己会装 pymupdf
+#    （见 build_exe.bat 的 `pip install pymupdf==2.0` + `--collect-all pymupdf`）。
+
+# ---- Web 进程需要的（与 requirements.txt 相同）----
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# FSRS-6 间隔重复（排期核心）。前端对应 ts-fsrs（见 web/package.json）。
+fsrs>=6.3
+
+# ---- 只有 PDF worker 子进程需要的 ----
+# 版本与 build_exe.bat 里的一致（2.0），避免桌面 exe 与服务器行为不同。
+# ⚠️ 忘了装这一行的症状：Web 一切正常，但**上传 PDF 永远失败**。
+#    客户端会报 worker_crashed，日志里有 import_error（不是超时）。
+#    快速自检：.venv/bin/python -c "import pymupdf; print(pymupdf.__doc__)"
+pymupdf==2.0
