@@ -24,6 +24,7 @@
  */
 import { ElMessage } from 'element-plus'
 import { make as makeStaticStore } from './store/static-store.js'
+import { authHeaders, handleUnauthorized, isAuthRequired } from './auth'
 
 export const STATIC = location.protocol === 'file:'
 
@@ -41,13 +42,29 @@ export async function api(path, body, method) {
     try { return staticRoute(path, body, method || (body ? 'POST' : 'GET')); }
     catch (e) { ElMessage.error('本地处理失败：' + e.message); return null; }
   }
+  const m = method || (body ? 'POST' : 'GET')
+  const payload = m === 'GET' ? undefined
+    : { method: m, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }
+  // 带令牌（公网模式）。本机模式 authHeaders() 返回空对象，行为不变。
+  const withAuth = (opts) => ({
+    ...opts,
+    headers: { ...(opts && opts.headers ? opts.headers : {}), ...authHeaders() },
+  })
   try {
-    const m = method || (body ? 'POST' : 'GET')
-    const r = await fetch(V1 + path, m === 'GET' ? undefined
-      : { method: m, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    let r = await fetch(V1 + path, payload === undefined ? undefined : withAuth(payload))
+    // 401 → 先试静默刷新（令牌可能只是过期了），成功就重试一次原请求
+    if (r.status === 401 && isAuthRequired()) {
+      if (await handleUnauthorized()) {
+        r = await fetch(V1 + path, payload === undefined ? undefined : withAuth(payload))
+      }
+    }
     if (!r.ok) {
       let d = 'HTTP ' + r.status;
-      try { d = (await r.json()).detail || d; } catch (e) { /* 非 JSON 错误体 */ }
+      try {
+        const j = await r.json();
+        // 统一错误格式（app/errors.py）：{"error":{"code","message"}}
+        d = (j.error && j.error.message) || j.detail || d;
+      } catch (e) { /* 非 JSON 错误体 */ }
       ElMessage.error(d);
       return null;
     }

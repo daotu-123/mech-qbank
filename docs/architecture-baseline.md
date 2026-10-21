@@ -41,18 +41,29 @@
 | 硬编码监听回环地址 | `api.py:316` `uvicorn.Config(app, host='127.0.0.1', …)`。端口已可配（`core.py:43` 读 `QBANK_PORT`），但**绑定地址无任何配置入口** |
 | Host/Origin 白名单只有三个 loopback 字面量 | `core.py:99` `ALLOWED_HOSTS = {'127.0.0.1','localhost','[::1]'}` |
 | 全项目**零账号、零 token、零 session** | `web/src/**` 与 `app/**` 检索 `login\|token\|auth\|userId\|sync` 无业务命中 |
-| 无登录页、无多用户切换 | `web/src/views/` 共 7 个：`TodayView / QuizView / ReviewView / WrongView / CardsView / StatsView / ExcerptView` |
+| 无多用户切换 | `web/src/views/` 共 8 个：`TodayView / QuizView / ReviewView / WrongView / CardsView / StatsView / ExcerptView / DocumentsView`。**单账号登录页已补**（`web/src/components/LoginDialog.vue`，仅公网模式出现） |
 | 无速率限制 | 全项目无限流中间件；`api.py:86-103` 的 `guard` 只校验 Host/Origin |
 | 打包目标是桌面双击即用 | `start.bat` 拉起 `--windowed` exe；APK 走 Capacitor |
 
-#### 由「公网单用户」新增的工作块（**本次不实施，仅登记边界**）
+#### 由「公网单用户」新增的工作块（**2026-10-21 已实施**）
 
-| # | 工作块 | 落点 | 关键约束 |
-|---|---|---|---|
-| **W1** | 绑定地址改为**配置驱动** | `api.py:316` | **默认仍为 `127.0.0.1`**，只有公网模式才切 `0.0.0.0`。本机开发与打包默认行为不变 |
-| **W2** | `ALLOWED_HOSTS` 改为**配置驱动** | `core.py:99` | 公网模式加入**实际域名**。不得为图省事放宽成通配或后缀匹配 |
-| **W3** | 新增鉴权 | 新中间件 | 当前零账号零 token。身份模型见 §0.3，令牌卫生见 §0.4 |
-| **W4** | 新增速率限制 | 新中间件 | **必须处理 `X-Forwarded-For`**，否则反代后所有请求的源 IP 都变成代理 IP，限流形同虚设 |
+| # | 工作块 | 落点 | 关键约束 | 实施状态 |
+|---|---|---|---|---|
+| **W1** | 绑定地址改为**配置驱动** | `app/security.py` `Config.bind` | **默认仍为 `127.0.0.1`**，只有公网模式才切 `0.0.0.0`。本机开发与打包默认行为不变 | ✅ 已实施 |
+| **W2** | `ALLOWED_HOSTS` 改为**配置驱动** | `app/security.py` `Config.allowed_hosts` | 公网模式加入**实际域名**。不得为图省事放宽成通配或后缀匹配 | ✅ 已实施（精确匹配） |
+| **W3** | 新增鉴权 | `app/security.py` `Account`/`TokenStore` + `api.py` `auth` 中间件 | 身份模型见 §0.3，令牌卫生见 §0.4 | ✅ 已实施（scrypt + HMAC/令牌表） |
+| **W4** | 新增速率限制 | `app/security.py` `RateLimiter` | **必须处理 `X-Forwarded-For`**，否则反代后所有请求的源 IP 都变成代理 IP，限流形同虚设 | ✅ 已实施（fail-closed 采信） |
+
+**部署步骤见 `docs/public-deploy.md`。**
+
+> ⚠️ **实施中发现的两个坑**（写在这里免得将来重犯）：
+> 1. **uvicorn 默认 `proxy_headers=True`**，会拿 `X-Forwarded-For` 覆盖
+>    `request.client` —— 任何客户端加个这个头就能让限流按它声明的 IP 计数，
+>    **限流形同虚设**。已显式关掉（`api.py` 的 `make_uvicorn_config`），
+>    改由 `security.client_ip()` 按「对端是否受信反代」自己判断。
+> 2. **健康检查必须豁免 Host 白名单**：反代的探针打过来时 Host 是**上游地址**
+>    （`127.0.0.1:8640`）而不是用户域名，按白名单拦会让公网部署的探针全 503，
+>    反代把服务踢下线。已豁免**且仅豁免** `/health/live` 与 `/health/ready`。
 
 #### 公网模式下**继续保留**的部分
 
@@ -140,8 +151,10 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 3. 保持并扩充测试安全网（含 `4045cd1` 新增的子进程启动测试，见 §8-c）
 4. 收拢魔法数字与 CSS 变量
 
-**登记但本次不实施**：§0.2 的 W1–W4 四个工作块。它们是公网化的独立立项，
-**不构成本次重构的前置条件**，也不在本次重构的验收范围内。
+**登记但当时不实施**（2026-10-21 已补做）：§0.2 的 W1–W4 四个工作块。
+它们是公网化的独立立项，**不构成本次重构的前置条件**——
+本次重构（分层、错误格式、日志、健康检查）在它们之前完成，六项基线当时全绿。
+M2 实施后基线仍全绿，见 `docs/public-deploy.md` 的部署步骤。
 
 ---
 
@@ -251,8 +264,11 @@ owner 曾据「多租户要把 `progress` 主键从 `id` 改成 `(user_id, qid)`
 | POST | `/api/v1/system/shutdown` | `api.py:314` | 退出服务（置 `SRV.should_exit`，见 `api.py:317-320`） |
 | — | `mount('/', StaticFiles(web/dist))` | `api.py:378-380` | `web/dist` 存在才挂；否则 `GET /` 返回 503 |
 
-传输层规则：Host/Origin 白名单中间件 `api.py:86-103`；CORS 只放行 localhost 任意端口 `api.py:107-109`；
-W3 鉴权占位中间件 `api.py:70-84`（`AUTH_ENABLED=False` 当前不生效）。
+传输层规则：Host/Origin 白名单中间件（`api.py` 的 `guard`）；CORS 只放行 localhost 任意端口
+（公网模式下追加配置里的域名）；**W3 鉴权中间件**（`api.py` 的 `auth`，
+`AUTH_ENABLED` 由 `security.Config.auth_enabled` 决定 —— 公网模式**强制开启**，
+本机模式默认关闭，行为与 M2 之前完全一致）；
+**W4 限流中间件**（`api.py` 的 `rate_limit`，只限上传接口）。
 **中间件执行顺序（2026-10-20 实测）**：FastAPI/Starlette **后注册先执行**。
 当前实际顺序 CORS → guard → auth，即 auth 挂在 guard **之后**（先过白名单、再验身份），
 符合 W3 的意图。要改这个顺序，只能调换装饰器在文件里的位置 —— 写在**后面**的先跑。

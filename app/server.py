@@ -50,6 +50,7 @@ import errors                                       # 统一错误格式 + reque
 import service                                       # 业务用例（纯标准库；与 api.py 共享同一份）
 import multipart                                     # multipart/form-data 解析（纯标准库，与 api.py 同一份）
 import docstore                                      # PDF 文档域（纯标准库；import 的是 pdf_client，不是 pymupdf）
+import security                                      # 公网安全原语 W1–W4（纯标准库；与 api.py 共享同一份）
 import time                                          # request_context 用它计时
 from core import *                                   # noqa: F401,F403 数据层与常量
 from core import STORE as _CORE_STORE                # noqa: F401  （保持 STORE 可被外部赋值）
@@ -62,6 +63,28 @@ from core import _alert, _log, _log_exc              # noqa: F401
 #: PDF 文档域实例（落盘 + job 表 + 后台解析线程）。在 main() 里初始化。
 #: 与 api.py 的 DOCSTORE 是同一份实现（app/docstore.py），保证两端行为等价。
 DOCSTORE = None
+
+# ---------------------------------------------------------------- 安全配置（单一来源）
+# 与 api.py 读**同一份**配置（app/security.py 的 Config），行为必须等价。
+# 默认（无环境变量）= 本机模式：绑 127.0.0.1、免鉴权、无限流、白名单三个本机名
+# —— 与 M2 之前的行为完全一致（硬门）。
+SEC = security.Config()
+ACCOUNT = security.Account(SEC)
+LIMITER = security.RateLimiter(SEC)
+AUTH_ENABLED = SEC.auth_enabled
+
+
+def reload_security(env=None) -> None:
+    """按当前环境变量重载安全配置（测试用；生产用不到）。
+
+    与 api.py 的同名函数**行为一致**（两套服务端共用同一份配置）。
+    重载会清空令牌表 —— 换配置 = 换一套会话。
+    """
+    global SEC, ACCOUNT, LIMITER, AUTH_ENABLED
+    SEC = security.reload_config(env)
+    ACCOUNT = security.Account(SEC)
+    LIMITER = security.RateLimiter(SEC)
+    AUTH_ENABLED = SEC.auth_enabled
 
 
 def _n_arg(q: dict, default: int = 10) -> int:
@@ -91,19 +114,81 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def _guard(self) -> bool:
-        """只放行 127.0.0.1 / localhost 的请求，挡 DNS rebinding 与跨站调用。
+        """只放行白名单里的 Host / Origin，挡 DNS rebinding 与跨站调用。
 
         场景：用户开着 App 时访问恶意页面，该页面把域名重绑到 127.0.0.1 后即与本服务同源，
         fetch('/api/progress') 会被浏览器放行 —— 全部进度/备注/打卡记录随之泄露。
+
+        ⚠️ W2：白名单现在是**配置驱动**的（app/security.py 的 Config），
+        默认仍是 127.0.0.1 / localhost / [::1] —— 本机行为一个字节没变。
+        **精确匹配**，绝不放宽成通配或后缀匹配。
         """
-        host = (self.headers.get('Host') or '').split(':')[0].strip()
-        if host not in ALLOWED_HOSTS:
+        host = self.headers.get('Host') or ''
+        if not SEC.host_allowed_for(self.path.split('?')[0], host):
             return False
         origin = self.headers.get('Origin')
         if origin:
-            if (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
+            if not SEC.host_allowed(urlparse(origin).hostname or ''):
                 return False
         return True
+
+    def _client_ip(self) -> str:
+        """取客户端 IP（限流与退避按它计）。
+
+        只有**对端本身是受信反代**时才采信 X-Forwarded-For，
+        否则一律用真实 peer 地址 —— XFF 是客户端可写的，无条件采信
+        等于让攻击者自己声明自己是谁，限流与审计全部失效。
+        """
+        peer = self.client_address[0] if self.client_address else ''
+        return security.client_ip(peer, self.headers.get('X-Forwarded-For') or '',
+                                  SEC.trusted_proxies, SEC.trusted_proxy_cidrs)
+
+    def _auth_exempt(self, path: str) -> bool:
+        """哪些路径不需要令牌。与 api.py 的 _is_auth_exempt **逐条对应**。
+
+        精确匹配，不做前缀以外的模糊判断
+        （'startswith("/api/v1/auth")' 会顺带放行 /api/v1/auth-anything）。
+        """
+        if path in ('/api/v1/auth/login', '/api/v1/auth/status',
+                    '/api/v1/auth/refresh', '/health/live', '/health/ready'):
+            return True
+        return path == '/' or path.startswith('/assets/') or path == '/index.html' \
+            or path == '/favicon.ico' or path.startswith('/static/')
+
+    def _check_auth(self, path: str):
+        """鉴权 + 失败退避。返回 None = 放行；否则返回要发的响应。"""
+        if not AUTH_ENABLED:
+            return None
+        if self._auth_exempt(path):
+            return None
+        ip = self._client_ip()
+        wait = LIMITER.auth_retry_after(ip)
+        if wait > 0:
+            self._logreq(429, 'too many requests')
+            resp = self.jerr('too_many_requests',
+                             'too many failed attempts, retry in %d seconds' % wait)
+            return resp
+        token = security.bearer_token(self.headers)
+        if not token or not ACCOUNT.authenticate(token):
+            # ⚠️ 日志里**不写**令牌、也不写 Authorization 头（令牌卫生第 1 条）
+            self._logreq(401, 'unauthorized')
+            return self.jerr('unauthorized', 'unauthorized')
+        return None
+
+    def _check_upload_rate(self, path: str):
+        """上传限流（W4）。返回 None = 放行；否则返回要发的响应。"""
+        if not AUTH_ENABLED:
+            return None
+        if self.command != 'POST' or path != '/api/v1/documents':
+            return None
+        ip = self._client_ip()
+        wait = LIMITER.upload_retry_after(ip)
+        if wait > 0:
+            self._logreq(429, 'too many requests')
+            return self.jerr('too_many_requests',
+                             'upload rate limit exceeded, retry in %d seconds' % wait)
+        LIMITER.record_upload(ip)
+        return None
 
     def _send(self, code, body, ctype='application/json; charset=utf-8'):
         self.send_response(code)
@@ -149,9 +234,22 @@ class H(BaseHTTPRequestHandler):
             self._logreq(403, 'forbidden')
             return self.jerr('forbidden')
         u = urlparse(self.path)
-        q = {k: v[0] for k, v in parse_qs(u.query).items()}
         p = u.path
+        # W3 鉴权（与 api.py 的 auth 中间件等价）：Host 守卫过了才验身份。
+        denied = self._check_auth(p)
+        if denied is not None:
+            return denied
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
+            # ---- 鉴权端点（W3，与 api.py 逐条等价）----
+            if p == '/api/v1/auth/status':
+                if not AUTH_ENABLED:
+                    return self.j({'auth_required': False, 'authenticated': True,
+                                   'account': ACCOUNT.name})
+                token = security.bearer_token(self.headers)
+                return self.j({'auth_required': True,
+                               'authenticated': bool(token and ACCOUNT.authenticate(token)),
+                               'account': ACCOUNT.name})
             # 健康检查与 api.py 等价：live 不碰数据层，ready 真的读一次
             if p == '/health/live':
                 self._logreq(200)
@@ -293,6 +391,16 @@ class H(BaseHTTPRequestHandler):
             self._logreq(403, 'forbidden')
             return self.jerr('forbidden')
         p = urlparse(self.path).path
+        # W3 鉴权：Host 守卫过了才验身份（与 api.py 的 auth 中间件等价）。
+        # ⚠️ 登录/轮换端点必须在**读 body 之前**放行，否则登录不了。
+        if p not in ('/api/v1/auth/login', '/api/v1/auth/refresh'):
+            denied = self._check_auth(p)
+            if denied is not None:
+                return denied
+        # W4 上传限流：在**读 body 之前**判，省掉一次 10MB 的传输。
+        limited = self._check_upload_rate(p)
+        if limited is not None:
+            return limited
         # Content-Length 超过上限 → 413（统一格式），不读 body 也不进业务逻辑。
         # 上限 10 MB 与重构前一致；api.py 侧由 uvicorn/Starlette 同样按此语义处理。
         raw_len = self.headers.get('Content-Length')
@@ -300,6 +408,10 @@ class H(BaseHTTPRequestHandler):
             self._logreq(413, 'payload too large')
             return self.jerr('payload_too_large', 'payload too large')
         n = clamp_int(raw_len or 0, 0, 0, 10 * 1024 * 1024)
+
+        # ---- 鉴权端点（W3，与 api.py 逐条等价）----
+        if p in ('/api/v1/auth/login', '/api/v1/auth/refresh', '/api/v1/auth/logout'):
+            return self._handle_auth_post(p, n)
 
         # ---- PDF 上传（multipart/form-data）----
         # 必须**先读原始字节**再判类型：JSON 分支要 dict，multipart 分支要 bytes。
@@ -352,6 +464,62 @@ class H(BaseHTTPRequestHandler):
             self._logreq(500, 'internal_error')
             return self.jerr('internal_error', 'internal error')
 
+    def _handle_auth_post(self, p: str, n: int):
+        """鉴权端点的 POST 处理（与 api.py 逐条等价）。
+
+        ⚠️ 口令与令牌都**不写进日志**（令牌卫生第 1 条）：
+        下面的 _logreq 只记 method/path/status/ms/note，不记 body。
+        """
+        try:
+            body = json.loads(self.rfile.read(n) or b'{}')
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        ip = self._client_ip()
+
+        if p == '/api/v1/auth/login':
+            if not AUTH_ENABLED:
+                return self.j({'auth_required': False, 'token': '', 'account': ACCOUNT.name})
+            wait = LIMITER.auth_retry_after(ip)
+            if wait > 0:
+                self._logreq(429, 'too many requests')
+                return self.jerr('too_many_requests',
+                                 'too many failed attempts, retry in %d seconds' % wait)
+            info = ACCOUNT.login(str(body.get('password') or ''))
+            if not info:
+                LIMITER.record_auth_failure(ip)
+                self._logreq(401, 'unauthorized')
+                # 响应里**不**说错在哪，也不带令牌
+                return self.jerr('unauthorized', 'invalid credentials')
+            LIMITER.record_auth_success(ip)
+            self._logreq(200, 'auth_ok')
+            return self.j({'auth_required': True, 'token': info['token'],
+                           'expires_at': info['expires_at'],
+                           'expires_in': info['expires_in'],
+                           'account': ACCOUNT.name})
+
+        if p == '/api/v1/auth/refresh':
+            if not AUTH_ENABLED:
+                return self.j({'auth_required': False, 'token': '', 'account': ACCOUNT.name})
+            info = ACCOUNT.rotate(str(body.get('token') or '')
+                                  or security.bearer_token(self.headers))
+            if not info:
+                self._logreq(401, 'unauthorized')
+                return self.jerr('unauthorized', 'unauthorized')
+            return self.j({'auth_required': True, 'token': info['token'],
+                           'expires_at': info['expires_at'],
+                           'expires_in': info['expires_in'],
+                           'account': ACCOUNT.name})
+
+        # logout
+        if not AUTH_ENABLED:
+            return self.j({'ok': True, 'auth_required': False})
+        token = security.bearer_token(self.headers)
+        ok = ACCOUNT.logout(token) if token else False
+        self._logreq(200, 'logout')
+        return self.j({'ok': True, 'revoked': ok})
+
     def do_DELETE(self):
         """DELETE /api/v1/documents/{id} —— 删除文档（级联）。
 
@@ -362,6 +530,9 @@ class H(BaseHTTPRequestHandler):
             self._logreq(403, 'forbidden')
             return self.jerr('forbidden')
         p = urlparse(self.path).path
+        denied = self._check_auth(p)
+        if denied is not None:
+            return denied
         try:
             if p.startswith('/api/v1/documents/'):
                 doc_id = p[len('/api/v1/documents/'):].strip('/')
@@ -384,6 +555,14 @@ class H(BaseHTTPRequestHandler):
 
 def main() -> int:
     global STORE, SRV, DOCSTORE
+    # ---- 启动自检（W1–W4）：配置有问题就**拒绝启动**（与 api.py 一致）----
+    cfg_errors = SEC.start_errors()
+    if cfg_errors:
+        for e in cfg_errors:
+            _log('✗ 配置错误：' + e)
+        _alert('启动失败：配置有问题。\n\n' + '\n'.join(cfg_errors)
+               + '\n\n详见 exe 同目录的 qbank.log')
+        return 1
     try:
         STORE = Store()
     except Exception:
@@ -394,6 +573,10 @@ def main() -> int:
     _log('mech-qbank 数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'
          % (s['mode'], s['total'], s['cards'], s['answered'], s['due']))
     _log('  来源分级：%s' % s['by_class'])
+    # 安全配置摘要。**只打配置状态，绝不打令牌/口令**（令牌卫生第 1 条）。
+    _log('  安全：绑定 %s ｜ 鉴权 %s ｜ 白名单 %s'
+         % (SEC.bind, '开' if AUTH_ENABLED else '关',
+            ','.join(sorted(SEC.allowed_hosts)) or '(空)'))
     # 文档域：与 api.py 同一份实现（app/docstore.py）。
     # 启动时把**遗留的** running/queued 标成 interrupted —— 不假装成功。
     try:
@@ -409,7 +592,10 @@ def main() -> int:
     ports = [PORT + i for i in range(PORT_SCAN)]      # 上次没关干净时自动换端口，双击就能起
     for port in ports:
         try:
-            srv = ThreadingHTTPServer(('127.0.0.1', port), H)
+            # ⚠️ W1：绑定地址配置驱动（默认 127.0.0.1，公网模式 0.0.0.0）。
+            # 必须用 SEC.bind 试端口，不能写死 127.0.0.1 —— 公网模式下
+            # 写死会误判「端口被占用」。
+            srv = ThreadingHTTPServer((SEC.bind, port), H)
             break
         except OSError:
             continue

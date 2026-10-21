@@ -31,7 +31,23 @@ export const OFFLINE = { offline: true };
 /** 服务端请求体上限，与 app/api.py 的 MAX_BODY_BYTES 同口径（10 MB）。 */
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
-const V1 = '/api/v1';
+import { authHeaders, handleUnauthorized, isAuthRequired } from './auth'
+
+const V1 = '/api/v1'
+
+/** 带令牌的 fetch。**令牌只走 Authorization 头**，绝不放 URL。 */
+async function authFetch(path, opts) {
+  const o = opts || {}
+  const headers = { ...(o.headers || {}), ...authHeaders() }
+  let r = await fetch(V1 + path, { ...o, headers })
+  // 401 → 静默刷新后重试一次（令牌可能只是过期）
+  if (r.status === 401 && isAuthRequired()) {
+    if (await handleUnauthorized()) {
+      r = await fetch(V1 + path, { ...o, headers: { ...headers, ...authHeaders() } })
+    }
+  }
+  return r
+};
 
 /** 任务状态 → 人话。顺序即展示顺序。 */
 export const JOB_STATUS_TEXT = {
@@ -127,34 +143,34 @@ export function fmtTime(iso) {
 
 /** 文档列表（只取摘要，不含页文本）。失败抛错，调用方负责提示。 */
 export async function listDocuments() {
-  const r = await fetch(V1 + '/documents');
+  const r = await authFetch('/documents');
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return (await r.json()).items || [];
 }
 
 export async function getDocument(id) {
-  const r = await fetch(V1 + '/documents/' + encodeURIComponent(id));
+  const r = await authFetch('/documents/' + encodeURIComponent(id));
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return (await r.json()).document;
 }
 
 /** 取第 page 页（从 1 起）的文本。 */
 export async function getPage(id, page) {
-  const r = await fetch(V1 + '/documents/' + encodeURIComponent(id)
+  const r = await authFetch('/documents/' + encodeURIComponent(id)
     + '/pages?page=' + encodeURIComponent(page));
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return await r.json();
 }
 
 export async function deleteDocument(id) {
-  const r = await fetch(V1 + '/documents/' + encodeURIComponent(id), { method: 'DELETE' });
+  const r = await authFetch('/documents/' + encodeURIComponent(id), { method: 'DELETE' });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return await r.json();
 }
 
 /** 查任务状态。**404 是正常结果**（job 表不跨重启），不当异常。 */
 export async function getJob(jobId) {
-  const r = await fetch(V1 + '/parse-jobs/' + encodeURIComponent(jobId));
+  const r = await authFetch('/parse-jobs/' + encodeURIComponent(jobId));
   if (r.status === 404) return { job: null, gone: true };
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return { job: (await r.json()).job, gone: false };
@@ -182,6 +198,7 @@ export function uploadDocument(file, onProgress) {
 
     // ⚠️ 不设 Content-Type：XHR 会自动带 multipart 边界。
     //    手写 multipart/form-data 会漏掉 boundary 参数，服务端解析必然失败。
+    // 令牌只走 Authorization 头（公网模式 W3）；本机模式 authHeaders() 是空对象。
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
     };
@@ -210,6 +227,8 @@ export function uploadDocument(file, onProgress) {
       err.code = 'aborted';
       reject(err);
     };
+    // 带令牌的请求头
+    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
     xhr.send(fd);
   });
   return { promise, cancel: () => { if (xhr) xhr.abort(); } };

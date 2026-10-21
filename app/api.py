@@ -66,8 +66,41 @@ import multipart
 # 它 import 的是 pdf_client（纯标准库）而不是 pdf_extract（会拖进 pymupdf），
 # 所以 Web 进程永远不持有 MuPDF。
 import docstore
+# security 是公网暴露安全的公共原语层（W1–W4），纯标准库，两套服务端共用。
+# 见 app/security.py 的模块说明：为什么口令用 scrypt、令牌用 HMAC+令牌表、
+# 以及 X-Forwarded-For 的采信规则（fail-closed）。
+import security
 from core import (ALLOWED_HOSTS, INTERVALS, PORT, PORT_SCAN, Store, _alert, _log, _log_exc,
                   clamp_int)
+
+# ---------------------------------------------------------------- 安全配置（单一来源）
+# 两套服务端读**同一份**配置（app/security.py 的 Config），行为必须一致。
+# 默认（无环境变量）= 本机模式：绑 127.0.0.1、免鉴权、无限流、白名单三个本机名
+# —— 与 M2 之前的行为**完全一致**（硬门）。
+SEC = security.Config()
+ACCOUNT = security.Account(SEC)
+LIMITER = security.RateLimiter(SEC)
+
+#: 公网模式下**必须**鉴权。已在 Config.auth_enabled 里强制，这里只是把
+#: 「本机模式 + 自愿设置口令哈希」的情况也纳入鉴权（QBANK_PASSWORD_HASH 非空即开）。
+AUTH_ENABLED = SEC.auth_enabled
+
+
+def reload_security(env=None) -> None:
+    """按当前环境变量重载安全配置（测试用；生产用不到）。
+
+    重载会清空令牌表（新的 Config → 新的 TokenStore）——
+    换配置 = 换一套会话，这是想要的行为。
+
+    ⚠️ **不重建 CORS 中间件**：FastAPI 的 add_middleware 必须在
+    app 启动前调用，运行时改不了。生产场景下 CORS 白名单本来就该
+    「改配置 → 重启」生效，不该有热切换的错觉。
+    """
+    global SEC, ACCOUNT, LIMITER, AUTH_ENABLED
+    SEC = security.reload_config(env)
+    ACCOUNT = security.Account(SEC)
+    LIMITER = security.RateLimiter(SEC)
+    AUTH_ENABLED = SEC.auth_enabled
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -86,23 +119,53 @@ STORE: Optional[Store] = None
 SRV = None            # uvicorn.Server 实例，供 /api/v1/system/shutdown 用
 
 
-# ---------------------------------------------------------------- 鉴权挂载点（W3，本轮不实现）
-# 目标形态是「公网单用户 + 单账号」（docs §0.2 / §0.3），届时需要一个鉴权中间件。
-# 本轮**只留位置，不实现**：AUTH_ENABLED 为 False 时下面什么都不做，行为与重构前完全一致。
+# ---------------------------------------------------------------- 鉴权（W3）
+# 目标形态是「公网单用户 + 单账号」（docs §0.2 / §0.3）。
 #
-# 实现时该怎么做（写在这里免得将来重新想）：
-#   · 鉴权中间件要挂在 guard **之后**（先过 Host/Origin 白名单，再验身份）。
-#     挂载方式（2026-10-20 实测确认，别再搞反）：
-#     FastAPI/Starlette 的中间件是**后注册先执行** —— 装饰器写在文件里越靠后，
-#     注册越晚，跑得越早。实测：注册顺序 guard→auth 时实际执行 auth→guard；
-#     注册顺序 auth→guard 时实际执行 guard→auth。
-#     所以要让 auth 跑在 guard **之后**，auth 必须**先注册**，
-#     即本装饰器必须写在 guard 装饰器**之前**（也就是本段在下方 guard 之前）。
-#   · 身份模型是单账号：口令 Argon2id，会话令牌**服务端签发、短时、可撤销**
-#     （不要用自签 JWT——自签无法撤销，与「可撤销」直接冲突）
-#   · 令牌卫生三通道（docs §0.4）：日志不得出现明文凭据、令牌不进 URL、Referrer-Policy
-#   · 现有 Host/Origin 守卫保留，二者并存
-AUTH_ENABLED = False
+# ## 中间件顺序（2026-10-20 实测确认，别再搞反）
+# FastAPI/Starlette 的中间件是**后注册先执行** —— 装饰器写在文件里越靠后，
+# 注册越晚，跑得越早。所以要让 auth 跑在 guard **之后**，auth 必须**先注册**，
+# 即本装饰器必须写在 guard 装饰器**之前**（也就是本段在下方 guard 之前）。
+#
+# ## 实现要点（都写在下面，别改）
+#   · 令牌走 `Authorization: Bearer`，**绝不进 URL**（令牌卫生第 2 条：
+#     URL 会进浏览器历史、Referer 头、代理与服务器日志）。
+#   · 令牌只在**内存**里，服务端可撤销（security.TokenStore）。
+#     不用自签 JWT：自签载荷带签发时间，服务端撤不掉。
+#   · 鉴权失败的日志**不含口令也不含令牌**（令牌卫生第 1 条）——
+#     注意别把 request.body 或 Authorization 头塞进日志。
+#   · 现有 Host/Origin 守卫保留，二者并存且职责不同：
+#     守卫回答「请求是否来自允许的来源」，鉴权回答「你是谁」。
+AUTH_ENABLED = SEC.auth_enabled
+
+
+def _client_ip(request: Request) -> str:
+    """取客户端 IP（限流与退避按它计）。
+
+    走 security.client_ip：只有**对端本身是受信反代**时才采信 X-Forwarded-For，
+    否则一律用真实 peer 地址。XFF 是客户端可写的，无条件采信等于让
+    攻击者自己声明自己是谁 —— 限流与审计全部失效。
+    """
+    peer = ''
+    try:
+        peer = (request.client.host if request.client else '') or ''
+    except Exception:
+        peer = ''
+    return security.client_ip(peer, request.headers.get('x-forwarded-for', ''),
+                              SEC.trusted_proxies, SEC.trusted_proxy_cidrs)
+
+
+def _unauthorized(request: Request, message: str = 'unauthorized', status: int = 401):
+    """统一的 401/403 响应。
+
+    ⚠️ 响应头里**不能**带 `WWW-Authenticate: Bearer` 之外的任何凭据信息；
+    也不要把令牌写进响应体。
+    """
+    errors.log_line(core._log, status, request.method, request.url.path,
+                    code='unauthorized' if status == 401 else 'forbidden')
+    return _err('unauthorized' if status == 401 else 'forbidden', message,
+                status=status, request=request)
+
 
 
 @app.middleware('http')
@@ -124,17 +187,84 @@ async def limit_body(request: Request, call_next):
 
 @app.middleware('http')
 async def auth(request: Request, call_next):
-    """W3 鉴权占位。当前 AUTH_ENABLED=False，直接放行。
+    """W3 鉴权：校验会话令牌，无令牌 → 401。
 
-    保留这个函数而不是「等要做鉴权时再加」，是为了让挂载顺序在代码里先固定下来：
-    中间件注册顺序一旦在实现时才决定，很容易和 guard 的顺序搞反。
+    ## 放行清单（这些路径**不需要**令牌）
+    · `/api/v1/auth/login`   —— 登录本身（否则无法登录）
+    · `/api/v1/auth/status`  —— 前端问「我现在要不要登录」
+    · `/health/live`         —— 存活探针（编排器要能探活）
+    · `/health/ready`        —— 就绪探针
+    · 静态资源（前端 dist）  —— 否则登录页自己都加载不出来
 
     ⚠️ 本装饰器**必须写在 guard 之前**（不是之后）：后注册先执行，
     先注册才会后跑，从而真正挂在 guard 之后。理由见上方注释。
     """
     if not AUTH_ENABLED:
         return await call_next(request)
-    # ---- 实现时在这里校验会话令牌，未登录返回 401 ----
+
+    path = request.url.path
+    # 放行清单：**精确前缀匹配**，不做模糊匹配
+    # （'startswith("/api/v1/auth")' 那种写法会顺带放行
+    #  /api/v1/auth-anything，是个真实的口子）。
+    if _is_auth_exempt(path):
+        return await call_next(request)
+
+    ip = _client_ip(request)
+    # 鉴权失败退避（W4）：这个 IP 连错太多次 → 先等一等再让它试。
+    # 在**读 body 之前**就拒，省掉 scrypt 的 32MB 内存硬开销 ——
+    # 否则攻击者可以用连打把服务器内存打满。
+    wait = LIMITER.auth_retry_after(ip)
+    if wait > 0:
+        errors.log_line(core._log, 429, request.method, path, code='too_many_requests')
+        resp = _err('too_many_requests',
+                    'too many failed attempts, retry in %d seconds' % wait,
+                    status=429, request=request)
+        resp.headers['Retry-After'] = str(wait)
+        return resp
+
+    token = security.bearer_token(request.headers)
+    if not token or not ACCOUNT.authenticate(token):
+        # ⚠️ 日志里**不写**令牌、也不写 Authorization 头（令牌卫生第 1 条）。
+        errors.log_line(core._log, 401, request.method, path, code='unauthorized')
+        return _err('unauthorized', 'unauthorized', status=401, request=request)
+    return await call_next(request)
+
+
+def _is_auth_exempt(path: str) -> bool:
+    """哪些路径不需要令牌。**精确匹配**，不做前缀以外的模糊判断。"""
+    if path in ('/api/v1/auth/login', '/api/v1/auth/status',
+                '/api/v1/auth/refresh', '/health/live', '/health/ready'):
+        return True
+    # 静态前端资源：登录页自己得能加载出来
+    return path == '/' or path.startswith('/assets/') or path == '/index.html' \
+        or path == '/favicon.ico' or path.startswith('/static/')
+
+
+@app.middleware('http')
+async def rate_limit(request: Request, call_next):
+    """W4 限流：上传接口的频率限制。
+
+    只限**上传**（POST /api/v1/documents）：那是唯一"重"的操作 ——
+    每个请求最多 10 MB 落盘 + 触发一次 PDF 解析。其它接口都很轻，
+    限了反而碍事。
+
+    计数按客户端 IP（见 _client_ip 的受信反代规则）。
+    """
+    if not AUTH_ENABLED:
+        return await call_next(request)
+    if request.method != 'POST' or request.url.path != '/api/v1/documents':
+        return await call_next(request)
+    ip = _client_ip(request)
+    wait = LIMITER.upload_retry_after(ip)
+    if wait > 0:
+        errors.log_line(core._log, 429, request.method, request.url.path,
+                        code='too_many_requests')
+        resp = _err('too_many_requests',
+                    'upload rate limit exceeded, retry in %d seconds' % wait,
+                    status=429, request=request)
+        resp.headers['Retry-After'] = str(wait)
+        return resp
+    LIMITER.record_upload(ip)
     return await call_next(request)
 
 
@@ -143,17 +273,22 @@ async def guard(request: Request, call_next):
     """Host/Origin 白名单 —— 与 server.py 的 _guard() 同语义，挡 DNS rebinding 与跨站调用。
 
     ⚠️ 公网化时**必须保留**（docs/architecture-baseline.md §0.2）：
-    它防的是 DNS rebinding 与跨站调用，与将来 W3 的鉴权**并存且职责不同** ——
+    它防的是 DNS rebinding 与跨站调用，与 W3 的鉴权**并存且职责不同** ——
     鉴权回答「你是谁」，本守卫回答「请求是否来自允许的来源」，不可互相替代。
+
+    ## W2：白名单现在是配置驱动的
+    `SEC.host_allowed()`（app/security.py）做**精确匹配**，
+    默认值仍是 127.0.0.1 / localhost / [::1] —— 本机行为一个字节没变。
+    公网模式用 QBANK_ALLOWED_HOSTS 给出实际域名。
+    **绝不放宽成通配或后缀匹配**（见 security.Config 的说明）。
 
     本装饰器**必须写在 auth 之后**（即在文件里更靠下），才能让 auth 挂在它之后执行。
     """
-    host = (request.headers.get('host') or '').split(':')[0].strip()
-    if host not in ALLOWED_HOSTS:
+    if not SEC.host_allowed_for(request.url.path, request.headers.get('host') or ''):
         errors.log_line(core._log, 403, request.method, request.url.path, code='forbidden')
         return _err('forbidden', 'forbidden')
     origin = request.headers.get('origin')
-    if origin and (urlparse(origin).hostname or '') not in ALLOWED_HOSTS:
+    if origin and not SEC.host_allowed(urlparse(origin).hostname or ''):
         errors.log_line(core._log, 403, request.method, request.url.path, code='forbidden')
         return _err('forbidden', 'forbidden')
     return await call_next(request)
@@ -194,8 +329,19 @@ async def request_context(request: Request, call_next):
 
 # 开发时前端跑 vite dev server（localhost:5173），跨域打本服务需要 CORS 响应头；
 # 只放行 localhost/127.0.0.1 任意端口，与 guard 的白名单同源。生产是同源，用不上。
+#
+# ⚠️ W2（公网模式）：上面的正则**只放行本机**，公网域名会被 CORS 拦。
+# 公网模式把配置里的域名也加进白名单（精确匹配，仍不放宽成通配）。
+# 默认配置下正则与原来**一字不差** —— 本机行为零变化。
+_CORS_ORIGINS = None
+if SEC.allowed_hosts - {'127.0.0.1', 'localhost', '[::1]'}:
+    # 有公网域名 → 显式列出。逐个 escape，避免域名里的正则元字符造成意外匹配。
+    import re as _re
+    _extra = '|'.join(_re.escape(h) for h in sorted(SEC.allowed_hosts)
+                       if h not in ('127.0.0.1', 'localhost', '[::1]'))
+    _CORS_ORIGINS = r'https?://(localhost|127\.0\.0\.1)(:\d+)?|https?://(' + _extra + r')(:\d+)?'
 app.add_middleware(CORSMiddleware,
-                   allow_origin_regex=r'https?://(localhost|127\.0\.0\.1)(:\d+)?',
+                   allow_origin_regex=(_CORS_ORIGINS or r'https?://(localhost|127\.0\.0\.1)(:\d+)?'),
                    allow_methods=['*'], allow_headers=['*'])
 
 
@@ -324,6 +470,107 @@ class CustomQIn(BaseModel):
     bank: str = ''
     section_path: str = ''
     cat_name: str = ''
+
+
+# ---------------------------------------------------------------- 鉴权端点（W3）
+# ⚠️ 这组端点**在鉴权开启时也需要放行**（见 _is_auth_exempt）：
+#   login  —— 否则无法登录；status —— 前端问「要不要登录」；
+#   refresh —— 令牌轮换用的就是**旧令牌**，走 auth 中间件会自我循环。
+#
+# 令牌卫生：
+#   · 口令与令牌都**不写进日志**（log_line 只记 method/path/status/ms）。
+#   · 令牌只出现在响应体里给前端，**不进 URL**。
+#   · 不提供任何「生成分享链接」的接口（那必然把令牌放进 URL）。
+
+
+class LoginIn(BaseModel):
+    password: str = ''
+
+
+class RefreshIn(BaseModel):
+    token: str = ''
+
+
+@app.post('/api/v1/auth/login')
+async def auth_login(body: LoginIn, request: Request):
+    """口令登录 → 签发会话令牌。
+
+    失败一律 401，**不区分**「口令错」与「别的错」——
+    提示越模糊，攻击者能试出的信息越少。
+
+    失败次数按客户端 IP 计数并退避（W4），见 auth 中间件。
+    """
+    if not AUTH_ENABLED:
+        # 本机模式（没配口令哈希）→ 直接放行，前端不必显示登录框
+        return {'auth_required': False, 'token': '', 'account': ACCOUNT.name}
+    ip = _client_ip(request)
+    wait = LIMITER.auth_retry_after(ip)
+    if wait > 0:
+        errors.log_line(core._log, 429, request.method, request.url.path,
+                        code='too_many_requests')
+        resp = _err('too_many_requests',
+                    'too many failed attempts, retry in %d seconds' % wait,
+                    status=429, request=request)
+        resp.headers['Retry-After'] = str(wait)
+        return resp
+    info = ACCOUNT.login(body.password or '')
+    if not info:
+        delay = LIMITER.record_auth_failure(ip)
+        errors.log_line(core._log, 401, request.method, request.url.path,
+                        code='unauthorized')
+        # 响应里**不**说错在哪，也不带令牌
+        return _err('unauthorized', 'invalid credentials', status=401, request=request)
+    LIMITER.record_auth_success(ip)
+    errors.log_line(core._log, 200, request.method, request.url.path, code='auth_ok')
+    return {'auth_required': True, 'token': info['token'],
+            'expires_at': info['expires_at'], 'expires_in': info['expires_in'],
+            'account': ACCOUNT.name}
+
+
+@app.get('/api/v1/auth/status')
+async def auth_status(request: Request):
+    """前端问「现在需要登录吗 / 我还在线吗」。
+
+    免鉴权放行（见 _is_auth_exempt）：它只回布尔，不泄露任何敏感信息。
+    """
+    if not AUTH_ENABLED:
+        return {'auth_required': False, 'authenticated': True, 'account': ACCOUNT.name}
+    token = security.bearer_token(request.headers)
+    return {'auth_required': True, 'authenticated': bool(token and ACCOUNT.authenticate(token)),
+            'account': ACCOUNT.name}
+
+
+@app.post('/api/v1/auth/refresh')
+async def auth_refresh(body: RefreshIn, request: Request):
+    """令牌轮换：拿旧令牌换新令牌，旧令牌**立即失效**。
+
+    「短时 + 可轮换」的落地：短时令牌到期前可以换新的，不用重输口令；
+    而旧令牌在轮换那一刻就废了 —— 泄露的旧令牌不会继续可用。
+    """
+    if not AUTH_ENABLED:
+        return {'auth_required': False, 'token': '', 'account': ACCOUNT.name}
+    info = ACCOUNT.rotate(body.token or security.bearer_token(request.headers))
+    if not info:
+        errors.log_line(core._log, 401, request.method, request.url.path,
+                        code='unauthorized')
+        return _err('unauthorized', 'unauthorized', status=401, request=request)
+    return {'auth_required': True, 'token': info['token'],
+            'expires_at': info['expires_at'], 'expires_in': info['expires_in'],
+            'account': ACCOUNT.name}
+
+
+@app.post('/api/v1/auth/logout')
+async def auth_logout(request: Request):
+    """登出：撤销当前令牌（服务端删表项，O(1)）。
+
+    撤销后这个令牌**立刻**失效 —— 这就是「不用自签 JWT」的理由。
+    """
+    if not AUTH_ENABLED:
+        return {'ok': True, 'auth_required': False}
+    token = security.bearer_token(request.headers)
+    ok = ACCOUNT.logout(token) if token else False
+    errors.log_line(core._log, 200, request.method, request.url.path, code='logout')
+    return {'ok': True, 'revoked': ok}
 
 
 # ---------------------------------------------------------------- 题库
@@ -609,7 +856,10 @@ def _pick_port():
         try:
             s = socket.socket()
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('127.0.0.1', p))
+            # ⚠️ W1：绑定地址改成配置驱动（默认 127.0.0.1）。
+            # 这里必须用 **bind 地址**去试端口，不能写死 127.0.0.1 ——
+            # 公网模式下绑 0.0.0.0，写死 127.0.0.1 试端口会误判「被占用」。
+            s.bind((SEC.bind, p))
             s.close()
             return p
         except OSError:
@@ -617,8 +867,35 @@ def _pick_port():
     return None
 
 
+def make_uvicorn_config(app_obj, host, port, log_config=None):
+    """造 uvicorn 配置。**测试与生产走同一条路**（别各写一份）。
+
+    ⚠️ `proxy_headers=False` 不是可选项，是**安全要求**（2026-10-21 实测）：
+    uvicorn 默认 `proxy_headers=True`，会拿 `X-Forwarded-For` 覆盖
+    `request.client` —— 任何客户端加个这个头就能让限流按它声明的 IP 计数，
+    限流形同虚设，我们自己那套「只在受信反代时采信」的规则也一并被绕过。
+
+    关掉它，让 `request.client` 保持真实 peer，
+    由 security.client_ip() 按受信反代列表决定要不要采信 XFF。
+    """
+    import uvicorn
+    return uvicorn.Config(app_obj, host=host, port=port,
+                           log_config=log_config, proxy_headers=False,
+                           forwarded_allow_ips='')
+
+
 def main() -> int:
     global STORE, SRV, DOCSTORE
+    # ---- 启动自检（W1–W4）：配置有问题就**拒绝启动** ----
+    # fail-closed 的理由：公网模式但没配域名时若「降级着跑」，
+    # owner 会以为已经公网化了 —— 那比直接报错危险得多。
+    cfg_errors = SEC.start_errors()
+    if cfg_errors:
+        for e in cfg_errors:
+            _log('✗ 配置错误：' + e)
+        _alert('启动失败：配置有问题。\n\n' + '\n'.join(cfg_errors)
+               + '\n\n详见 exe 同目录的 qbank.log')
+        return 1
     try:
         STORE = Store()
     except Exception:
@@ -641,6 +918,10 @@ def main() -> int:
     _log('mech-qbank（FastAPI）数据模式：%s ｜ 题 %d ｜ 卡片 %d ｜ 已答 %d ｜ 待复习 %d'
          % (s['mode'], s['total'], s['cards'], s['answered'], s['due']))
     _log('  来源分级：%s' % s['by_class'])
+    # 安全配置摘要。**只打配置状态，绝不打令牌/口令**（令牌卫生第 1 条）。
+    _log('  安全：绑定 %s ｜ 鉴权 %s ｜ 白名单 %s'
+         % (SEC.bind, '开' if AUTH_ENABLED else '关',
+            ','.join(sorted(SEC.allowed_hosts)) or '(空)'))
     actual = _pick_port()
     if actual is None:
         _log('⚠ 端口 %d–%d 都被占用了。关掉旧实例，或设 QBANK_PORT 换一个端口。'
@@ -650,6 +931,8 @@ def main() -> int:
         return 1
     if actual != PORT:
         _log('⚠ %d 被占用，已自动改用 %d' % (PORT, actual))
+    # 浏览器打开的地址：公网模式下用 127.0.0.1 不合适（本机也通，但没意义），
+    # 用 localhost 至少不会误导。域名由反代负责。
     _log('mech-qbank 已启动  http://127.0.0.1:%d' % actual)
     _log('  关闭方式：点页面右下角「退出程序」按钮（本程序无终端窗口）')
     if os.environ.get('QBANK_NO_BROWSER') != '1':      # 双击 exe 时自动开界面；设 1 可关掉
@@ -659,7 +942,9 @@ def main() -> int:
     LOGGING = {'version': 1, 'disable_existing_loggers': False,
                'handlers': {'null': {'class': 'logging.NullHandler'}},
                'root': {'handlers': ['null'], 'level': 'INFO'}}
-    config = uvicorn.Config(app, host='127.0.0.1', port=actual, log_config=LOGGING)
+    # ⚠️ W1：host 用配置里的绑定地址（默认 127.0.0.1，公网模式 0.0.0.0）
+    # make_uvicorn_config 里显式关掉 proxy_headers —— 那是安全要求，不是选项。
+    config = make_uvicorn_config(app, SEC.bind, actual, log_config=LOGGING)
     SRV = uvicorn.Server(config)
     SRV.run()
     return 0

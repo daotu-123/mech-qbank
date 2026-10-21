@@ -22,7 +22,7 @@ mech-qbank · errors 层：统一错误响应格式（两套服务端共用）
     {"error": {"code": "...", "message": "...", "request_id": "..."}}
 
 code 是**稳定英文标识**（前端可依赖它做分支，不要去匹配 message）：
-invalid_param / not_found / unauthorized / forbidden /
+invalid_param / not_found / unauthorized / forbidden / too_many_requests /
 internal_error / payload_too_large / unsupported_type
 
 request_id 每个请求生成一次，**同时出现在响应体与日志**，是把两者对上的唯一线索。
@@ -50,6 +50,8 @@ CODE_STATUS = {
     'not_found': 404,
     'unauthorized': 401,
     'forbidden': 403,
+    # W4 速率限制。429 是 HTTP 标准码，前端可依赖它做退避重试。
+    'too_many_requests': 429,
     'internal_error': 500,
     'payload_too_large': 413,
     'unsupported_type': 415,

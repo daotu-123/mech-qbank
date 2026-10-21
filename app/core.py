@@ -104,6 +104,14 @@ def resolve_rating(result: str) -> str:
 # 本机服务只认这些 Host / Origin —— 挡 DNS rebinding（恶意页面把域名重绑到 127.0.0.1 后与目标同源，
 # 浏览器同源策略会放行，届时它能读 /api/progress、/api/notes 并跨站 POST 改写进度/备注）。
 # 将来若要局域网/手机访问，需显式把 IP 加进来，并同时把绑定地址从 127.0.0.1 放开。
+#
+# ⚠️ W2（2026-10-21）：这组值现在是**配置驱动**的（app/security.py 的 Config）。
+#   · 默认仍是这三个本机名 —— 本机/打包的默认行为一个字节都没变。
+#   · 公网模式用 QBANK_ALLOWED_HOSTS 给出**实际域名**（逗号分隔，精确匹配）。
+#   · **绝不放宽成通配或后缀匹配**：它是 DNS rebinding 防护，
+#     「.example.com 会不会匹配 evil.com」这类判断一旦写错就等于全开放。
+#   · 真正的判定在 security.Config.host_allowed()，这里保留为「默认值常量」，
+#     供两套服务端在没有配置对象时回退使用。
 ALLOWED_HOSTS = {'127.0.0.1', 'localhost', '[::1]'}
 TRUE_SET = {'对', '正确', '是', '√', '✓', 'true', 't', 'yes', 'y', '1'}
 FALSE_SET = {'错', '错误', '否', '×', '✗', 'x', 'false', 'f', 'no', '0', '2'}

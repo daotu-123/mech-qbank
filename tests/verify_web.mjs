@@ -126,26 +126,47 @@ async function withChrome(fn) {
   // 删不掉还留一堆临时目录。它在 %TEMP% 下，由系统自己回收。
   // 复用固定目录名，隔次运行 Chrome 自己会复用/更新其中的数据。
   const profile = join(tmpdir(), 'qbank-cdp-profile')
-  const proc = spawn(CHROME, [
+  // host-resolver-rules：把公网测试域名解析到 127.0.0.1。
+  // 为什么必须这样：公网模式的 Host 白名单里是「域名」，而 HTTP 连接
+  // 打的是 127.0.0.1 —— **Host 头与连接地址是两回事**。
+  // 用 CDP 的 Network.setExtraHTTPHeaders 设 Host 也不行：
+  // Host 是 Chrome 的**禁止头**，设了直接 ERR_INVALID_ARGUMENT
+  // （实测：页面整个打不开，报「无法访问此网站」）。
+  // 所以走 DNS 层面 —— 这也最接近真实反代场景。
+  const args = [
     '--headless=new', `--remote-debugging-port=${port}`,
     `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
-    '--disable-gpu', '--allow-file-access-from-files', 'about:blank',
-  ], { stdio: 'ignore' })
+    '--disable-gpu', '--allow-file-access-from-files',
+    // ⚠️ 必须关掉 Chrome 自己的代理：本机 http_proxy 会把打向
+    // mech.example.com 的请求也发给代理，代理回 502
+    // （症状：页面显示「HTTP ERROR 502」）。
+    // 环境变量清了不够 —— Chrome 读的是自己的代理设置/系统设置。
+    '--no-proxy-server',
+    '--host-resolver-rules=MAP mech.example.com 127.0.0.1',
+    'about:blank',
+  ]
+  const proc = spawn(CHROME, args, { stdio: 'ignore' })
   try {
     const cdp = await CDP.attach(port)
     await cdp.send('Page.enable')
     await cdp.send('Runtime.enable')
     await cdp.send('Log.enable')
     const errors = []
+    // 真正的应用异常（未捕获 JS 异常）与浏览器记的 network error **要分开**：
+    // 公网模式下 401 是**预期行为**（鉴权生效的证据），浏览器会记成
+    // network error —— 把它当「控制台报错」会导致验收永远红。
+    const exceptions = []
     cdp.on('Runtime.exceptionThrown', (p) => {
-      errors.push('未捕获异常：' + (p.exceptionDetails?.exception?.description
-        || p.exceptionDetails?.text || '?'))
+      const text = '未捕获异常：' + (p.exceptionDetails?.exception?.description
+        || p.exceptionDetails?.text || '?')
+      exceptions.push(text)
+      errors.push(text)
     })
     cdp.on('Log.entryAdded', (p) => {
       // 只收 error 级；浏览器对 file:// 下 favicon 之类的告警不算
       if (p.entry && p.entry.level === 'error') errors.push(p.entry.text)
     })
-    await fn(cdp, errors)
+    await fn(cdp, errors, exceptions)
   } finally {
     proc.kill()
     // 只删我们自己造的那两个 5MB 假 PDF（各 1 个文件，不触发批量保护）
@@ -208,7 +229,7 @@ async function cleanDocs() {
  * 直接在仓库里跑 api.py 会读写真实的 data/（用户进度与备注）。
  * 复制 app/ 到临时目录后，core.ROOT 随位置走，真实数据一个字节都不碰。
  */
-async function startServer() {
+async function startServer(envExtra) {
   const dir = mkdtempSync(join(tmpdir(), 'qbank-web-'))
   mkdirSync(join(dir, 'app'), { recursive: true })
   mkdirSync(join(dir, 'data', 'public'), { recursive: true })
@@ -222,19 +243,19 @@ async function startServer() {
   // 而报错长得像「前端没部署」，与本用例要验的东西毫无关系
   // （第一次跑就撞上，报「在线模式显示上传入口」失败，真实原因是这个）。
   cpSync(join(ROOT, 'web', 'dist'), join(dir, 'web', 'dist'), { recursive: true })
-  const port = 18800 + Math.floor(Math.random() * 400)
+  const port = 18800 + Math.floor(Math.random() * 400) + (envExtra && envExtra.QBANK_PUBLIC ? 400 : 0)
   const url = 'http://127.0.0.1:' + port
   // 清代理：本机 http_proxy 会把打向 127.0.0.1 的请求也发给代理，代理回 502，
   // 症状长得像「服务没起来」。双击 exe 的真实场景本来就没有代理。
   const env = { ...process.env, QBANK_NO_BROWSER: '1', QBANK_PORT: String(port),
-                QBANK_PORT_SCAN: '1' }
+                QBANK_PORT_SCAN: '1', ...(envExtra || {}) }
   for (const k of ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']) delete env[k]
   const proc = spawn(PY, [join(dir, 'app', 'api.py')], { cwd: dir, stdio: 'ignore', env })
   if (!(await waitPort(url, 45000))) {
     proc.kill()
     throw new Error('临时服务端起不来（解释器 ' + PY + '）')
   }
-  return { url, stop: () => { try { proc.kill() } catch (e) { /* 已退出 */ } } }
+  return { url, port, stop: () => { try { proc.kill() } catch (e) { /* 已退出 */ } } }
 }
 
 async function waitPort(url, timeout) {
@@ -614,6 +635,134 @@ async function testOnline(cdp, errors) {
   check('在线模式控制台无报错', real.length === 0, real.slice(0, 3).join(' | '))
 }
 
+/* ---------------------------------------------------------------- 5. 公网模式鉴权 */
+
+/**
+ * 公网模式下的前端：登录框出现 → 输错口令被拒 → 输对口令能用。
+ *
+ * ## 为什么单独起一个服务
+ * 公网模式要 QBANK_PUBLIC=1 + 口令哈希 + 域名白名单，这些是**环境变量**，
+ * 必须在进程启动时给。已在运行的服务改不了。
+ *
+ * ## 为什么要验这一层
+ * 后端 30 项测试验的是「HTTP 契约」。这一层验的是**用户真的能用**：
+ * 登录框弹不弹、登不登得进去、登进去之后页面是不是真能用。
+ * 只测后端的话，可能后端全对而前端根本没接上（前端不弹框 = 用户永远登不进）。
+ */
+async function testPublicAuth(cdp, errors, exceptions) {
+  console.log('\n== 5. 公网模式：登录框 ==')
+  // 口令哈希：用 python 算一份（scrypt，标准库）
+  const { execFileSync } = await import('node:child_process')
+  const hash = execFileSync(PY, ['-c',
+    'import sys; sys.path.insert(0, "app"); import security;'
+    + ' print(security.hash_password("test-pw-123"))'],
+    { cwd: ROOT, encoding: 'utf8' }).trim()
+
+  const pub = await startServer({
+    QBANK_PUBLIC: '1',
+    QBANK_ALLOWED_HOSTS: 'mech.example.com',
+    QBANK_PASSWORD_HASH: hash,
+  })
+  const savedBase = BASE
+  // ⚠️ 用**域名**访问（不是 127.0.0.1）：公网模式的 Host 白名单里是域名，
+  // 而 Host 头必须与它一致。Chrome 的 --host-resolver-rules 把该域名
+  // 解析到 127.0.0.1，所以实际还是打本机端口。
+  const pubURL = pub.url.replace('127.0.0.1', 'mech.example.com')
+  BASE = pubURL
+  try {
+    await cdp.goto(BASE + '/#/')
+    const dlgShown = await cdp.waitFor(async () =>
+      (await cdp.text()).includes('登录 mech-qbank'), 25000, 150)
+    check('公网模式弹出登录框', dlgShown === true)
+    const txt = await cdp.text()
+    check('登录框说明「口令不会保存在本机」',
+      txt.includes('口令不会保存在本机'), txt.slice(0, 200))
+
+    // 输错口令 → 提示错误，登录框不关
+    await cdp.eval(`(() => {
+      const inp = document.querySelector('.el-dialog input[type=password]');
+      if (!inp) return 'no-input';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, 'wrong-password');
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'ok';
+    })()`)
+    await cdp.sleep(300)
+    await cdp.eval(`(() => {
+      const btn = [...document.querySelectorAll('.el-dialog button')]
+        .find(b => b.innerText.trim() === '登录');
+      if (btn) btn.click();
+      return !!btn;
+    })()`)
+    await cdp.sleep(2500)
+    const afterWrong = await cdp.text()
+    check('错口令被拒（提示错误，登录框仍在）',
+      afterWrong.includes('口令不对') && afterWrong.includes('登录 mech-qbank'),
+      afterWrong.slice(0, 200))
+
+    // 输对口令 → 登录成功，登录框关闭
+    await cdp.eval(`(() => {
+      const inp = document.querySelector('.el-dialog input[type=password]');
+      if (!inp) return 'no-input';
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, 'test-pw-123');
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'ok';
+    })()`)
+    await cdp.sleep(300)
+    await cdp.eval(`(() => {
+      const btn = [...document.querySelectorAll('.el-dialog button')]
+        .find(b => b.innerText.trim() === '登录');
+      if (btn) btn.click();
+      return !!btn;
+    })()`)
+    const loggedIn = await cdp.waitFor(async () =>
+      !(await cdp.text()).includes('登录 mech-qbank'), 20000, 200)
+    check('正确口令登录成功（登录框关闭）', loggedIn === true)
+
+    // 登录后页面能用（数据真的取到了）
+    await cdp.eval('location.hash = "#/stats"')
+    const usable = await cdp.waitFor(async () => {
+      const t = await cdp.text()
+      return t.includes('进度') || t.includes('总题数') || t.includes('题') ? t : ''
+    }, 15000, 200)
+    check('登录后页面能正常取数据', !!usable, (await cdp.text()).slice(0, 200))
+
+    // 令牌卫生：令牌**不在 URL** 里，也不在 localStorage 里
+    const hygiene = await cdp.eval(`(() => {
+      const url = location.href;
+      const ls = [];
+      try { for (let i = 0; i < localStorage.length; i++) ls.push(localStorage.key(i)); } catch (e) {}
+      const ss = [];
+      try { for (let i = 0; i < sessionStorage.length; i++) ss.push(sessionStorage.key(i)); } catch (e) {}
+      return JSON.stringify({ url, localStorageKeys: ls, sessionStorageKeys: ss });
+    })()`)
+    const h = JSON.parse(hygiene)
+    check('令牌不在 URL 里（无 tok_ 字样）', h.url.indexOf('tok_') < 0, h.url)
+    check('令牌不在 localStorage 里', !h.localStorageKeys.some((k) => /auth|token/i.test(k)),
+      JSON.stringify(h.localStorageKeys))
+    check('令牌只放 sessionStorage（不进 localStorage）',
+      h.localStorageKeys.length === 0 || !h.localStorageKeys.some((k) => /auth|token/i.test(k)),
+      JSON.stringify(h.localStorageKeys))
+    check('sessionStorage 里有会话条目', h.sessionStorageKeys.length > 0,
+      JSON.stringify(h.sessionStorageKeys))
+
+    // ⚠️ 401 在这里**是预期行为**：未登录时前端照常发请求（探状态/取数据），
+    // 服务端按设计回 401，浏览器控制台会记一条 network error。
+    // 那是「鉴权生效了」的证据，不是应用报错。
+    // 所以断言分两层：**应用异常**必须为 0（exceptions 只收未捕获 JS 异常），
+    // 而 network error 里允许出现 4xx。
+    const realExc = (exceptions || []).filter((e) => !/favicon/i.test(e))
+    check('公网模式无未捕获 JS 异常', realExc.length === 0, realExc.slice(0, 3).join(' | '))
+    // 反向对照：确实收到过 401（证明鉴权真的在拦，不是「压根没请求」）
+    const saw401 = errors.some((e) => /\b401\b/.test(e))
+    check('未登录时服务端确实回过 401（鉴权在拦）', saw401)
+  } finally {
+    BASE = savedBase
+    pub.stop()
+  }
+}
+
 /* ---------------------------------------------------------------- 跑 */
 
 if (!existsSync(DIST)) { console.error('没有 web/dist/index.html —— 先 npm run build'); process.exit(2) }
@@ -636,15 +785,17 @@ if (external) {
 }
 
 try {
-  await withChrome(async (cdp, errors) => {
+  await withChrome(async (cdp, errors, exceptions) => {
     await testOffline(cdp, errors.slice())
     errors.length = 0
     await testOnline(cdp, errors)
+    errors.length = 0
+    if (exceptions) exceptions.length = 0
+    await testPublicAuth(cdp, errors, exceptions)
   })
 } finally {
   if (srv) srv.stop()
 }
-
 console.log('\n========== 结果：' + pass + ' 通过 / ' + fail + ' 失败 ==========')
 if (failures.length) { console.log('失败项：'); failures.forEach((f) => console.log('  · ' + f)) }
 process.exit(fail ? 1 : 0)

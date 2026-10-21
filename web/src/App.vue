@@ -46,6 +46,8 @@
       <button v-if="!STATIC" class="ghost" style="margin-left:10px;padding:3px 10px;font-size:12px;vertical-align:middle" @click="quit">退出程序</button>
     </footer>
   </main>
+  <!-- 公网模式（W3）：需要鉴权时才出现。本机模式（默认）永远不显示。 -->
+  <LoginDialog v-model="showLogin" @logged-in="loggedIn = true" />
 </template>
 
 <script setup>
@@ -55,12 +57,29 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { api, quitApp, STATIC } from '@/api'
 import { MODE_TEXT } from '@/util'
+import { checkAuth, isAuthRequired, setUnauthorizedHandler } from '@/auth'
+import LoginDialog from '@/components/LoginDialog.vue'
 
 const stats = ref(null);
 const modeText = computed(() => (stats.value && MODE_TEXT[stats.value.mode]) || '公开子集');
 const modeOffline = computed(() => stats.value && stats.value.mode === 'static');
 
+/** 公网模式（W3）：需要登录时弹登录框。本机模式永远不弹。 */
+const showLogin = ref(false)
+const loggedIn = ref(false)
+
+/** 401 时的兜底：任何请求返回 401 都弹登录框。 */
+setUnauthorizedHandler(() => { showLogin.value = true; });
+
 onMounted(async () => {
+  // 先问要不要登录（**不阻塞**首屏渲染）：本机模式立刻返回 auth_required=false，
+  // 页面照常显示；公网模式则弹登录框。
+  if (!STATIC) {
+    try {
+      const a = await checkAuth();
+      if (a.auth_required && !a.authenticated) showLogin.value = true;
+    } catch (e) { /* 网络不通不该把人锁在外面 */ }
+  }
   const s = await api('/stats');
   if (s) stats.value = s;
 });
