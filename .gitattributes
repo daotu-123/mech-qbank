@@ -3,3 +3,23 @@
 # git 会把它误判成文本，clone 时 checkout 做 LF->CRLF 转换会改写字节、毁掉样本。
 # 2026-10-20 实测：不加这行，git diff --numstat 对它输出文本行数而非 "-"。
 tests/fixtures/pdf/*.pdf binary
+
+# ---- Linux 部署工件必须保持 LF ----
+# 本机 core.autocrlf=true，会把 LF 转成 CRLF。2026-10-21 实测：
+# clone 出来的 deploy/backup.sh 有 350 个 CR 字节，shebang 变成
+#     #!/usr/bin/env bash\r
+# 在 Linux 上直接执行会报 `bad interpreter: /usr/bin/env: 'bash\r'`。
+# 同样的问题会坑 systemd unit（\r 粘在 Environment 的值里）
+# 与 Caddyfile（解析器对 \r 的容忍度不保证）。
+#
+# eol=lf 强制 checkout 时用 LF，与 autocrlf 无关。
+deploy/backup.sh   text eol=lf
+deploy/*.service   text eol=lf
+deploy/Caddyfile   text eol=lf
+deploy/README.md   text eol=lf
+requirements-server.txt text eol=lf
+
+# ---- 其它 shell / 配置文件同理 ----
+*.sh        text eol=lf
+*.service   text eol=lf
+*.bat       text eol=crlf
